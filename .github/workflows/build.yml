@@ -1,0 +1,52 @@
+name: Build ABDOSAPlayerHead
+
+on:
+  push:
+    branches: ["build/player-head-redirect", "main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone CommonLibF4
+        shell: pwsh
+        run: |
+          git clone --recursive https://github.com/libxse/commonlibf4.git lib/commonlibf4
+
+      - name: Setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Configure
+        shell: pwsh
+        run: xmake f -m releasedbg -y
+
+      - name: Build
+        shell: pwsh
+        run: xmake -y
+
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter ABDOSAPlayerHead.dll | Select-Object -First 1
+          if (-not $dll) { throw 'ABDOSAPlayerHead.dll was not produced' }
+          New-Item -ItemType Directory -Force package/Data/F4SE/Plugins | Out-Null
+          Copy-Item $dll.FullName package/Data/F4SE/Plugins/ABDOSAPlayerHead.dll
+          New-Item -ItemType Directory -Force package/Data/Meshes/Actors/Character/CharacterAssets/ABDOSAPlayerHead | Out-Null
+          @'
+          Put the supplied custom files here and rename exactly:
+          BaseFemaleHead_faceBones.nif
+          FemaleheadRear_faceBones.nif
+          '@ | Set-Content package/Data/Meshes/Actors/Character/CharacterAssets/ABDOSAPlayerHead/PUT_MESHES_HERE.txt
+          Copy-Item README.md package/README.md
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ABDOSAPlayerHead
+          path: package
