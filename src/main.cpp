@@ -1,7 +1,7 @@
 namespace
 {
-    constexpr RE::FormID kFemaleFaceHeadPart = 0x000CFB3F;
-    constexpr RE::FormID kFemaleRearHeadPart = 0x0004D0E9;
+    constexpr std::uint32_t kFemaleFaceHeadPart = 0x000CFB3F;
+    constexpr std::uint32_t kFemaleRearHeadPart = 0x0004D0E9;
 
     constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
     constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
@@ -17,8 +17,10 @@ namespace
             return false;
         }
 
-        auto* face = RE::TESForm::GetFormByID(kFemaleFaceHeadPart)->As<RE::BGSHeadPart>();
-        auto* rear = RE::TESForm::GetFormByID(kFemaleRearHeadPart)->As<RE::BGSHeadPart>();
+        auto* faceForm = RE::TESForm::GetFormByID(kFemaleFaceHeadPart);
+        auto* rearForm = RE::TESForm::GetFormByID(kFemaleRearHeadPart);
+        auto* face = faceForm ? faceForm->As<RE::BGSHeadPart>() : nullptr;
+        auto* rear = rearForm ? rearForm->As<RE::BGSHeadPart>() : nullptr;
         if (!face || !rear) {
             REX::ERROR("Could not resolve vanilla female head parts");
             return false;
@@ -31,19 +33,26 @@ namespace
             g_rearOriginal = rear->GetModel() ? rear->GetModel() : "";
         }
 
-        // Temporarily redirect the two vanilla female head-part model paths.
-        // The player head is rebuilt immediately, then the records are restored so NPCs stay vanilla.
+        // Redirect only while the player's 3D rebuild is executed synchronously.
         face->SetModel(kCustomFace);
         rear->SetModel(kCustomRear);
 
         player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kHead);
         player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kFace);
-        player->Update3DModel();
+
+        if (player->currentProcess) {
+            player->currentProcess->Update3DModel(player);
+        } else {
+            REX::WARN("Player AIProcess is not ready; head rebuild deferred");
+            face->SetModel(g_faceOriginal.c_str());
+            rear->SetModel(g_rearOriginal.c_str());
+            return false;
+        }
 
         face->SetModel(g_faceOriginal.c_str());
         rear->SetModel(g_rearOriginal.c_str());
 
-        REX::INFO("Applied ABDOSA custom front/rear head meshes to player and restored global paths");
+        REX::INFO("Applied custom front/rear head meshes to player and restored vanilla global paths");
         return true;
     }
 
