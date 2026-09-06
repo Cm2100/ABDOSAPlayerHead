@@ -1,8 +1,5 @@
 namespace
 {
-    constexpr std::uint32_t kFemaleFaceHeadPart = 0x000CFB3F;
-    constexpr std::uint32_t kFemaleRearHeadPart = 0x0004D0E9;
-
     constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
     constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
 
@@ -18,11 +15,55 @@ namespace
         return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
     }
 
-    [[nodiscard]] bool ResolveVanillaHeadParts(RE::BGSHeadPart*& a_face, RE::BGSHeadPart*& a_rear)
+    [[nodiscard]] RE::BGSHeadPart* FindPartByType(
+        std::span<RE::BGSHeadPart*> a_parts,
+        RE::BGSHeadPart::HeadPartType a_type)
     {
-        a_face = RE::TESForm::GetFormByID<RE::BGSHeadPart>(kFemaleFaceHeadPart);
-        a_rear = RE::TESForm::GetFormByID<RE::BGSHeadPart>(kFemaleRearHeadPart);
-        return a_face && a_rear;
+        for (auto* part : a_parts) {
+            if (part && part->type == a_type) {
+                return part;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool ResolvePlayerSourceParts(
+        RE::TESNPC* a_playerNPC,
+        RE::BGSHeadPart*& a_face,
+        RE::BGSHeadPart*& a_rear)
+    {
+        if (!a_playerNPC) {
+            return false;
+        }
+
+        // Prefer the ACTIVE list. This is important because LooksMenu/race/chargen can
+        // give the player a different HeadRear record than Fallout4.esm|04D0E9.
+        auto active = a_playerNPC->GetHeadParts(true);
+        a_face = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kFace);
+        a_rear = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kHeadRear);
+
+        // Fall back to the base NPC list only for whichever type was not present.
+        auto base = a_playerNPC->GetHeadParts(false);
+        if (!a_face) {
+            a_face = FindPartByType(base, RE::BGSHeadPart::HeadPartType::kFace);
+        }
+        if (!a_rear) {
+            a_rear = FindPartByType(base, RE::BGSHeadPart::HeadPartType::kHeadRear);
+        }
+
+        if (!a_face || !a_rear) {
+            REX::ERROR(
+                "Could not resolve player source head parts by TYPE. face={}, rear={}",
+                a_face != nullptr,
+                a_rear != nullptr);
+            return false;
+        }
+
+        REX::INFO(
+            "Resolved PLAYER source parts by TYPE. face={:08X}, rear={:08X}",
+            a_face->GetFormID(),
+            a_rear->GetFormID());
+        return true;
     }
 
     [[nodiscard]] RE::BGSHeadPart* DuplicateHeadPart(RE::BGSHeadPart* a_source, const char* a_model)
@@ -42,13 +83,13 @@ namespace
         return duplicate;
     }
 
-    [[nodiscard]] bool EnsurePlayerHeadParts(RE::BGSHeadPart* a_vanillaFace, RE::BGSHeadPart* a_vanillaRear)
+    [[nodiscard]] bool EnsurePlayerHeadParts(RE::BGSHeadPart* a_sourceFace, RE::BGSHeadPart* a_sourceRear)
     {
         if (!g_playerFacePart) {
-            g_playerFacePart = DuplicateHeadPart(a_vanillaFace, kCustomFace);
+            g_playerFacePart = DuplicateHeadPart(a_sourceFace, kCustomFace);
         }
         if (!g_playerRearPart) {
-            g_playerRearPart = DuplicateHeadPart(a_vanillaRear, kCustomRear);
+            g_playerRearPart = DuplicateHeadPart(a_sourceRear, kCustomRear);
         }
 
         if (!g_playerFacePart || !g_playerRearPart) {
@@ -62,13 +103,15 @@ namespace
         return true;
     }
 
-    [[nodiscard]] bool PatchHeadPartSpan(
-        std::span<RE::BGSHeadPart*> a_parts,
-        RE::BGSHeadPart* a_vanillaFace,
-        RE::BGSHeadPart* a_vanillaRear)
+    struct PatchResult
     {
-        bool hasFace = false;
-        bool hasRear = false;
+        bool face{ false };
+        bool rear{ false };
+    };
+
+    [[nodiscard]] PatchResult PatchHeadPartSpan(std::span<RE::BGSHeadPart*> a_parts)
+    {
+        PatchResult result{};
 
         for (auto& part : a_parts) {
             if (!part) {
@@ -76,43 +119,48 @@ namespace
             }
 
             if (part == g_playerFacePart) {
-                hasFace = true;
+                result.face = true;
                 continue;
             }
             if (part == g_playerRearPart) {
-                hasRear = true;
+                result.rear = true;
                 continue;
             }
 
-            if (part == a_vanillaFace || part->GetFormID() == kFemaleFaceHeadPart) {
+            // Do NOT depend on Fallout4.esm FormIDs here. Replace whichever Face and
+            // HeadRear records the PLAYER actually owns, including LooksMenu/custom ones.
+            if (part->type == RE::BGSHeadPart::HeadPartType::kFace) {
                 part = g_playerFacePart;
-                hasFace = true;
-            } else if (part == a_vanillaRear || part->GetFormID() == kFemaleRearHeadPart) {
+                result.face = true;
+            } else if (part->type == RE::BGSHeadPart::HeadPartType::kHeadRear) {
                 part = g_playerRearPart;
-                hasRear = true;
+                result.rear = true;
             }
         }
 
-        return hasFace && hasRear;
+        return result;
     }
 
-    [[nodiscard]] bool AssignPlayerOnlyHeadParts(
-        RE::TESNPC* a_playerNPC,
-        RE::BGSHeadPart* a_vanillaFace,
-        RE::BGSHeadPart* a_vanillaRear)
+    [[nodiscard]] bool AssignPlayerOnlyHeadParts(RE::TESNPC* a_playerNPC)
     {
         if (!a_playerNPC) {
             return false;
         }
 
-        bool baseOK = PatchHeadPartSpan(a_playerNPC->GetHeadParts(false), a_vanillaFace, a_vanillaRear);
+        const auto base = PatchHeadPartSpan(a_playerNPC->GetHeadParts(false));
+        const auto active = PatchHeadPartSpan(a_playerNPC->GetHeadParts(true));
 
-        // If the player is currently using an alternate head-part list (race/chargen path),
-        // patch that list too. When no alternate list is active this simply sees the same
-        // base list and is harmless.
-        bool activeOK = PatchHeadPartSpan(a_playerNPC->GetHeadParts(true), a_vanillaFace, a_vanillaRear);
+        const bool faceOK = base.face || active.face;
+        const bool rearOK = base.rear || active.rear;
 
-        return baseOK || activeOK;
+        REX::INFO(
+            "PLAYER head array patched by TYPE. base(face={},rear={}) active(face={},rear={})",
+            base.face,
+            base.rear,
+            active.face,
+            active.rear);
+
+        return faceOK && rearOK;
     }
 
     bool RebuildPlayerHead(RE::PlayerCharacter* a_player)
@@ -152,26 +200,25 @@ namespace
             return false;
         }
 
-        RE::BGSHeadPart* vanillaFace = nullptr;
-        RE::BGSHeadPart* vanillaRear = nullptr;
-        if (!ResolveVanillaHeadParts(vanillaFace, vanillaRear)) {
-            REX::ERROR("Could not resolve vanilla female head parts");
+        RE::BGSHeadPart* sourceFace = nullptr;
+        RE::BGSHeadPart* sourceRear = nullptr;
+        if (!ResolvePlayerSourceParts(playerNPC, sourceFace, sourceRear)) {
             return false;
         }
 
-        if (!EnsurePlayerHeadParts(vanillaFace, vanillaRear)) {
+        if (!EnsurePlayerHeadParts(sourceFace, sourceRear)) {
             return false;
         }
 
-        if (!AssignPlayerOnlyHeadParts(playerNPC, vanillaFace, vanillaRear)) {
-            REX::ERROR("Player NPC head-part array did not contain the vanilla female face/rear records");
+        if (!AssignPlayerOnlyHeadParts(playerNPC)) {
+            REX::ERROR("Player NPC head-part arrays did not expose both Face and HeadRear types");
             return false;
         }
 
-        // IMPORTANT: shared Fallout4.esm HDPT records are NEVER modified here.
-        // NPCs therefore keep BaseFemaleHead.nif / FemaleheadRear.nif permanently,
-        // while only Player NPC points at our duplicated BGSHeadPart forms.
-        REX::INFO("PLAYER now owns private face/rear head-part pointers; shared NPC HDPTs untouched");
+        // No shared Fallout4.esm HDPT model path is changed at any point.
+        // NPCs keep whatever normal Face/HeadRear records they already use.
+        // Only the PLAYER's head-part pointers are replaced with private duplicates.
+        REX::INFO("PLAYER owns private Face/HeadRear parts; all NPC head-part records untouched");
         return RebuildPlayerHead(player);
     }
 
@@ -223,6 +270,6 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead loaded; true player-only duplicated HDPT architecture armed");
+    REX::INFO("ABDOSAPlayerHead loaded; player-only head split by HeadPart TYPE armed");
     return true;
 }
