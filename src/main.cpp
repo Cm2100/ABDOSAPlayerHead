@@ -3,15 +3,16 @@ namespace
     constexpr std::uint32_t kFemaleFaceHeadPart = 0x000CFB3F;
     constexpr std::uint32_t kFemaleRearHeadPart = 0x0004D0E9;
 
+    // PLAYER-only temporary redirect targets.
     constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
     constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
 
+    // Explicit vanilla paths for every other female character.
+    constexpr auto kVanillaFace = "Actors\\Character\\CharacterAssets\\BaseFemaleHead.nif";
+    constexpr auto kVanillaRear = "Actors\\Character\\CharacterAssets\\FaceParts\\FemaleheadRear.nif";
+
     constexpr std::uint64_t kDoUpdate3DModelOG = 114457;
     constexpr std::uint64_t kDoUpdate3DModelNG = 2232144;
-
-    std::string g_faceOriginal;
-    std::string g_rearOriginal;
-    bool g_redirectActive = false;
 
     [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
     {
@@ -28,40 +29,36 @@ namespace
         return a_face && a_rear;
     }
 
-    void RestoreVanillaHeadPaths()
+    void RestoreNPCVanillaHeadPaths()
     {
         RE::BGSHeadPart* face = nullptr;
         RE::BGSHeadPart* rear = nullptr;
         if (!ResolveHeadParts(face, rear)) {
-            REX::ERROR("Could not resolve vanilla female head parts while restoring paths");
+            REX::ERROR("Could not resolve female head parts while restoring NPC vanilla paths");
             return;
         }
 
-        if (!g_faceOriginal.empty()) {
-            face->SetModel(g_faceOriginal.c_str());
-        }
-        if (!g_rearOriginal.empty()) {
-            rear->SetModel(g_rearOriginal.c_str());
-        }
+        // Do not restore some mod-provided/global value. Force the exact vanilla female
+        // front/rear meshes so all NPC females remain on the normal Fallout 4 head.
+        face->SetModel(kVanillaFace);
+        rear->SetModel(kVanillaRear);
 
-        g_redirectActive = false;
-        REX::INFO("Restored vanilla global female head model paths after player rebuild window");
+        REX::INFO("NPC female head paths forced to vanilla: {} | {}", kVanillaFace, kVanillaRear);
     }
 
-    void QueueRestore(std::uint32_t a_frames)
+    void QueueRestore(std::uint32_t a_ticks)
     {
         const auto* tasks = F4SE::GetTaskInterface();
         if (!tasks) {
-            REX::WARN("F4SE task interface unavailable; restoring paths immediately");
-            RestoreVanillaHeadPaths();
+            RestoreNPCVanillaHeadPaths();
             return;
         }
 
-        tasks->AddTask([a_frames]() {
-            if (a_frames > 1) {
-                QueueRestore(a_frames - 1);
+        tasks->AddTask([a_ticks]() {
+            if (a_ticks > 1) {
+                QueueRestore(a_ticks - 1);
             } else {
-                RestoreVanillaHeadPaths();
+                RestoreNPCVanillaHeadPaths();
             }
         });
     }
@@ -84,7 +81,7 @@ namespace
         const auto id = GetDoUpdate3DModelID();
         REL::Relocation<update3d_t> doUpdate3D{ REL::ID(id) };
 
-        REX::INFO("Calling DoUpdate3dModel relocation ID {}", id);
+        REX::INFO("Calling DoUpdate3dModel relocation ID {} for PLAYER", id);
         doUpdate3D(a_player->currentProcess, static_cast<RE::Actor*>(a_player), kHeadFaceFlags);
         return true;
     }
@@ -104,30 +101,20 @@ namespace
             return false;
         }
 
-        if (g_faceOriginal.empty()) {
-            g_faceOriginal = face->GetModel() ? face->GetModel() : "";
-        }
-        if (g_rearOriginal.empty()) {
-            g_rearOriginal = rear->GetModel() ? rear->GetModel() : "";
-        }
-
-        REX::INFO("Original face model: {}", g_faceOriginal);
-        REX::INFO("Original rear model: {}", g_rearOriginal);
-
+        // Temporarily point the two shared female head-part records at the custom meshes.
+        // Only the PLAYER is rebuilt during this window.
         face->SetModel(kCustomFace);
         rear->SetModel(kCustomRear);
-        g_redirectActive = true;
 
-        REX::INFO("Temporary player rebuild redirect enabled");
-        const bool rebuilt = RebuildPlayerHead(player);
-        if (!rebuilt) {
-            RestoreVanillaHeadPaths();
+        REX::INFO("PLAYER redirect enabled: {} | {}", kCustomFace, kCustomRear);
+
+        if (!RebuildPlayerHead(player)) {
+            RestoreNPCVanillaHeadPaths();
             return false;
         }
 
-        // DoUpdate3dModel can start model/resource work that outlives this call.
-        // Keep the redirected paths alive for two task ticks so the PLAYER rebuild
-        // can actually consume the custom NIF paths, then restore vanilla paths.
+        // Give the player's resource request enough task ticks to consume the custom NIFs,
+        // then hard-restore the shared records to the exact vanilla female meshes.
         QueueRestore(2);
         return true;
     }
@@ -155,10 +142,12 @@ namespace
 
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
-            // Run on the task queue instead of inside the load-game message itself.
+            // First guarantee NPCs are on vanilla paths, then rebuild only the player.
+            RestoreNPCVanillaHeadPaths();
             QueueApply(30);
             break;
         case F4SE::MessagingInterface::kNewGame:
+            RestoreNPCVanillaHeadPaths();
             QueueApply(30);
             break;
         default:
@@ -183,6 +172,6 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead loaded; delayed player-only head redirect armed");
+    REX::INFO("ABDOSAPlayerHead loaded; player custom head + NPC vanilla head split armed");
     return true;
 }
