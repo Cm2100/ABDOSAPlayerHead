@@ -1,136 +1,220 @@
+#include <atomic>
+#include <cstring>
+
 namespace
 {
-    constexpr std::uint32_t kMaxDumpNodes = 700;
-    constexpr std::uint32_t kMaxDumpDepth = 16;
+    constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
+    constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
+    constexpr auto kVanillaFaceSuffix = "BaseFemaleHead_faceBones.nif";
+    constexpr auto kVanillaRearSuffix = "FemaleheadRear_faceBones.nif";
 
-    [[nodiscard]] const char* SafeName(RE::NiAVObject* a_object)
+    constexpr std::uint64_t kDoUpdate3DModelOG = 114457;
+    constexpr std::uint64_t kDoUpdate3DModelNG = 2232144;
+
+    using Args = RE::BSModelDB::DBTraits::ArgsType;
+    using Demand1Fn = RE::BSResource::ErrorCode (*)(const char*, RE::BSModelDB::Handle&, const Args&);
+    using Demand2Fn = RE::BSResource::ErrorCode (*)(const char*, RE::NiPointer<RE::NiNode>*, const Args&);
+
+    Demand1Fn g_originalDemand1 = nullptr;
+    Demand2Fn g_originalDemand2 = nullptr;
+
+    std::atomic_bool g_redirectWindow{ false };
+    std::atomic_uint32_t g_faceRedirects{ 0 };
+    std::atomic_uint32_t g_rearRedirects{ 0 };
+    std::atomic_bool g_appliedThisLoad{ false };
+
+    [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
     {
-        if (!a_object) {
-            return "<null>";
-        }
-        const auto& name = a_object->GetName();
-        return name.empty() ? "<unnamed>" : name.c_str();
+        const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
+        return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
     }
 
-    [[nodiscard]] const char* SafeType(RE::NiAVObject* a_object)
+    [[nodiscard]] bool EndsWithI(const char* a_value, const char* a_suffix)
     {
-        if (!a_object) {
-            return "<null>";
+        if (!a_value || !a_suffix) {
+            return false;
         }
-        const auto* rtti = a_object->GetRTTI();
-        return rtti && rtti->GetName() ? rtti->GetName() : "<no-rtti>";
+
+        const auto valueLen = std::strlen(a_value);
+        const auto suffixLen = std::strlen(a_suffix);
+        if (valueLen < suffixLen) {
+            return false;
+        }
+
+        return _stricmp(a_value + valueLen - suffixLen, a_suffix) == 0;
     }
 
-    void DumpTree(RE::NiAVObject* a_object, std::uint32_t a_depth, std::uint32_t& a_count, const char* a_tag)
+    [[nodiscard]] const char* RedirectPath(const char* a_name)
     {
-        if (!a_object || a_count >= kMaxDumpNodes || a_depth > kMaxDumpDepth) {
-            return;
+        if (!a_name || !g_redirectWindow.load(std::memory_order_acquire)) {
+            return a_name;
         }
 
-        ++a_count;
+        if (EndsWithI(a_name, kVanillaFaceSuffix)) {
+            const auto hit = ++g_faceRedirects;
+            REX::INFO("RUN13 redirect FACE request #{}: {} -> {}", hit, a_name, kCustomFace);
+            return kCustomFace;
+        }
+
+        if (EndsWithI(a_name, kVanillaRearSuffix)) {
+            const auto hit = ++g_rearRedirects;
+            REX::INFO("RUN13 redirect REAR request #{}: {} -> {}", hit, a_name, kCustomRear);
+            return kCustomRear;
+        }
+
+        return a_name;
+    }
+
+    RE::BSResource::ErrorCode Demand1Hook(const char* a_name, RE::BSModelDB::Handle& a_result, const Args& a_args)
+    {
+        return g_originalDemand1(RedirectPath(a_name), a_result, a_args);
+    }
+
+    RE::BSResource::ErrorCode Demand2Hook(const char* a_name, RE::NiPointer<RE::NiNode>* a_result, const Args& a_args)
+    {
+        return g_originalDemand2(RedirectPath(a_name), a_result, a_args);
+    }
+
+    void InstallModelHooks()
+    {
+        F4SE::AllocTrampoline(128);
+        auto& trampoline = F4SE::GetTrampoline();
+
+        REL::Relocation<std::uintptr_t> demand1{ RE::ID::BSModelDB::Demand1 };
+        REL::Relocation<std::uintptr_t> demand2{ RE::ID::BSModelDB::Demand2 };
+
+        g_originalDemand1 = reinterpret_cast<Demand1Fn>(
+            trampoline.write_branch<5>(demand1.address(), Demand1Hook));
+        g_originalDemand2 = reinterpret_cast<Demand2Fn>(
+            trampoline.write_branch<5>(demand2.address(), Demand2Hook));
+
         REX::INFO(
-            "{} depth={} addr={} parent={} type={} name={}",
-            a_tag,
-            a_depth,
-            static_cast<const void*>(a_object),
-            static_cast<const void*>(a_object->parent),
-            SafeType(a_object),
-            SafeName(a_object));
-
-        auto* node = a_object->IsNode();
-        if (!node) {
-            return;
-        }
-
-        for (auto& child : node->children) {
-            if (child) {
-                DumpTree(child.get(), a_depth + 1, a_count, a_tag);
-            }
-        }
+            "RUN13 BSModelDB hooks installed. Demand1={} Demand2={}",
+            reinterpret_cast<const void*>(demand1.address()),
+            reinterpret_cast<const void*>(demand2.address()));
     }
 
-    void DumpHeadParts(const char* a_label, std::span<RE::BGSHeadPart*> a_parts)
+    [[nodiscard]] RE::BGSHeadPart* FindPartByType(
+        std::span<RE::BGSHeadPart*> a_parts,
+        RE::BGSHeadPart::HeadPartType a_type)
     {
-        REX::INFO("{} count={}", a_label, a_parts.size());
-        std::size_t index = 0;
         for (auto* part : a_parts) {
-            if (!part) {
-                REX::INFO("{}[{}] <null>", a_label, index++);
-                continue;
+            if (part && part->type == a_type) {
+                return part;
             }
-
-            REX::INFO(
-                "{}[{}] form={:08X} type={} model={} textureSet={} chargen={}",
-                a_label,
-                index++,
-                part->GetFormID(),
-                static_cast<std::int32_t>(part->type.get()),
-                part->GetModel() ? part->GetModel() : "<null-model>",
-                static_cast<const void*>(part->textureSet),
-                part->ChargenModel.GetModel() ? part->ChargenModel.GetModel() : "<null>");
         }
+        return nullptr;
     }
 
-    [[nodiscard]] bool DumpPlayerHeadState()
+    [[nodiscard]] bool PlayerFemaleHeadReady(RE::PlayerCharacter* a_player)
+    {
+        if (!a_player || !a_player->Get3D() || !a_player->GetFaceNodeSkinned()) {
+            return false;
+        }
+
+        auto* npc = a_player->GetNPC();
+        if (!npc) {
+            return false;
+        }
+
+        auto active = npc->GetHeadParts(true);
+        auto* face = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kFace);
+        auto* rear = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kHeadRear);
+        if (!face || !rear) {
+            return false;
+        }
+
+        const auto* faceCG = face->ChargenModel.GetModel();
+        const auto* rearCG = rear->ChargenModel.GetModel();
+        const bool femaleFace = faceCG && EndsWithI(faceCG, kVanillaFaceSuffix);
+        const bool femaleRear = rearCG && EndsWithI(rearCG, kVanillaRearSuffix);
+
+        if (!femaleFace || !femaleRear) {
+            REX::INFO(
+                "RUN13 waiting for female player head. faceCG={} rearCG={}",
+                faceCG ? faceCG : "<null>",
+                rearCG ? rearCG : "<null>");
+        }
+        return femaleFace && femaleRear;
+    }
+
+    bool RebuildPlayerHeadWithRedirect()
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            REX::WARN("RUN12 diagnostic: Player singleton not ready");
+        if (!PlayerFemaleHeadReady(player) || !player->currentProcess) {
             return false;
         }
 
-        auto* player3D = player->Get3D();
-        auto* faceSkinned = player->GetFaceNodeSkinned();
-        auto* faceNode = player->GetFaceNode();
-
-        REX::INFO(
-            "RUN12 diagnostic: player={:08X} 3D={} faceSkinned={} faceNode={}",
-            player->GetFormID(),
-            static_cast<const void*>(player3D),
-            static_cast<const void*>(faceSkinned),
-            static_cast<const void*>(faceNode));
-
-        if (auto* npc = player->GetNPC()) {
-            REX::INFO(
-                "RUN12 diagnostic: Player NPC={:08X} alternateHeadParts={}",
-                npc->GetFormID(),
-                npc->UsingAlternateHeadPartList());
-            DumpHeadParts("RUN12 PLAYER active HeadParts", npc->GetHeadParts(true));
-            DumpHeadParts("RUN12 PLAYER base HeadParts", npc->GetHeadParts(false));
+        if (g_appliedThisLoad.exchange(true)) {
+            return true;
         }
 
-        if (!player3D || !faceSkinned) {
-            REX::WARN("RUN12 diagnostic: player 3D/face node not ready yet");
-            return false;
-        }
+        g_faceRedirects.store(0);
+        g_rearRedirects.store(0);
+        g_redirectWindow.store(true, std::memory_order_release);
 
-        std::uint32_t faceCount = 0;
-        auto* faceAsAV = reinterpret_cast<RE::NiAVObject*>(faceSkinned);
-        REX::INFO("RUN12 FACE TREE BEGIN");
-        DumpTree(faceAsAV, 0, faceCount, "RUN12 FACE");
-        REX::INFO("RUN12 FACE TREE END nodes={}", faceCount);
+        constexpr auto kHeadFaceFlags = static_cast<RE::RESET_3D_FLAGS>(
+            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kHead) |
+            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kFace));
 
-        std::uint32_t fullCount = 0;
-        REX::INFO("RUN12 PLAYER 3D TREE BEGIN");
-        DumpTree(player3D, 0, fullCount, "RUN12 3D");
-        REX::INFO("RUN12 PLAYER 3D TREE END nodes={}", fullCount);
+        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kHead);
+        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kFace);
+
+        using Update3DFn = void (*)(RE::AIProcess*, RE::Actor*, RE::RESET_3D_FLAGS);
+        const auto id = GetDoUpdate3DModelID();
+        REL::Relocation<Update3DFn> doUpdate3D{ REL::ID(id) };
+
+        REX::INFO("RUN13 starting PLAYER-only head rebuild; redirect window ARMED. relocation={}", id);
+        doUpdate3D(player->currentProcess, static_cast<RE::Actor*>(player), kHeadFaceFlags);
 
         REX::INFO(
-            "RUN12 DIAGNOSTIC COMPLETE. No HeadPart, FaceGen, texture, mesh path, or rendered node was modified.");
+            "RUN13 DoUpdate3DModel returned. faceRedirects={} rearRedirects={}",
+            g_faceRedirects.load(),
+            g_rearRedirects.load());
+
         return true;
     }
 
-    void QueueDump(std::uint32_t a_attempts)
+    void QueueCloseWindow(std::uint32_t a_ticks)
     {
         const auto* tasks = F4SE::GetTaskInterface();
         if (!tasks) {
-            DumpPlayerHeadState();
+            g_redirectWindow.store(false, std::memory_order_release);
+            return;
+        }
+
+        tasks->AddTask([a_ticks]() {
+            if (a_ticks > 1) {
+                QueueCloseWindow(a_ticks - 1);
+                return;
+            }
+
+            g_redirectWindow.store(false, std::memory_order_release);
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            auto* faceNode = player ? player->GetFaceNodeSkinned() : nullptr;
+            REX::INFO(
+                "RUN13 redirect window CLOSED. faceRedirects={} rearRedirects={} faceNode={}",
+                g_faceRedirects.load(),
+                g_rearRedirects.load(),
+                static_cast<const void*>(faceNode));
+        });
+    }
+
+    void QueueApply(std::uint32_t a_attempts)
+    {
+        const auto* tasks = F4SE::GetTaskInterface();
+        if (!tasks) {
+            if (RebuildPlayerHeadWithRedirect()) {
+                QueueCloseWindow(4);
+            }
             return;
         }
 
         tasks->AddTask([a_attempts]() {
-            if (!DumpPlayerHeadState() && a_attempts > 1) {
-                QueueDump(a_attempts - 1);
+            if (RebuildPlayerHeadWithRedirect()) {
+                QueueCloseWindow(4);
+            } else if (a_attempts > 1) {
+                QueueApply(a_attempts - 1);
             }
         });
     }
@@ -144,7 +228,8 @@ namespace
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
-            QueueDump(30);
+            g_appliedThisLoad.store(false);
+            QueueApply(120);
             break;
         default:
             break;
@@ -156,6 +241,8 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
 
+    InstallModelHooks();
+
     if (const auto messaging = F4SE::GetMessagingInterface()) {
         messaging->RegisterListener(MessageHandler);
     } else {
@@ -166,6 +253,7 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead RUN12 loaded; SAFE rendered-head diagnostics only");
+    REX::INFO(
+        "ABDOSAPlayerHead RUN13 loaded; PLAYER-SCOPED FaceGen model-request redirect. No HeadPart records or texture paths are modified.");
     return true;
 }
