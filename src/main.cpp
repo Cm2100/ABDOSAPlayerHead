@@ -41,8 +41,24 @@ namespace
         REX::INFO("{} count={}", a_label, a_parts.size());
         std::size_t index = 0;
         for (auto* part : a_parts) {
-            const auto itemLabel = fmt::format("{}[{}]", a_label, index++);
-            DumpHeadPart(itemLabel.c_str(), part);
+            if (!part) {
+                REX::INFO("{}[{}] <null>", a_label, index++);
+                continue;
+            }
+
+            REX::INFO(
+                "{}[{}] form={:08X} type={} flags={} model={} textureSet={} chargen={} morph0={} morph1={} morph2={}",
+                a_label,
+                index++,
+                part->GetFormID(),
+                static_cast<std::int32_t>(part->type.get()),
+                static_cast<std::uint32_t>(part->flags.underlying()),
+                part->GetModel() ? part->GetModel() : "<null-model>",
+                static_cast<const void*>(part->textureSet),
+                part->ChargenModel.GetModel() ? part->ChargenModel.GetModel() : "<null>",
+                part->morphs[0].GetModel() ? part->morphs[0].GetModel() : "<null>",
+                part->morphs[1].GetModel() ? part->morphs[1].GetModel() : "<null>",
+                part->morphs[2].GetModel() ? part->morphs[2].GetModel() : "<null>");
         }
     }
 
@@ -98,11 +114,6 @@ namespace
 
     void CopyHeadPartMetadata(RE::BGSHeadPart* a_duplicate, RE::BGSHeadPart* a_source)
     {
-        // CreateDuplicateForm() did not preserve the BGSHeadPart-specific payload on this
-        // runtime. The old RUN9 log proved that: after replacing the player list, both
-        // private forms stopped matching Face/HeadRear TYPE. The same missing payload can
-        // also drop the texture set and produce a dark face. Copy every rendering/chargen
-        // field explicitly, then change ONLY the primary mesh path.
         static_cast<RE::TESModel*>(a_duplicate)->CopyComponent(static_cast<RE::TESModel*>(a_source));
         a_duplicate->swapForm = a_source->swapForm;
         a_duplicate->colorRemappingIndex = a_source->colorRemappingIndex;
@@ -161,11 +172,7 @@ namespace
             g_playerRearPart = DuplicateHeadPart(a_sourceRear, kCustomRear);
         }
 
-        if (!g_playerFacePart || !g_playerRearPart) {
-            return false;
-        }
-
-        return true;
+        return g_playerFacePart && g_playerRearPart;
     }
 
     struct PatchResult
