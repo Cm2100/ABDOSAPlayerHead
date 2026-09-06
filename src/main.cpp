@@ -1,258 +1,274 @@
-#include <MinHook.h>
-#ifdef ERROR
-#    undef ERROR
-#endif
-
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 
 namespace
 {
     constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
     constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
-    constexpr auto kVanillaFaceSuffix = "BaseFemaleHead_faceBones.nif";
-    constexpr auto kVanillaRearSuffix = "FemaleheadRear_faceBones.nif";
+    constexpr auto kTargetFaceName = "FemaleHeadHuman";
+    constexpr auto kTargetRearName = "FemaleHeadHumanRearTEMP";
+    constexpr auto kDynamicRTTIName = "BSDynamicTriShape";
 
-    constexpr std::uint64_t kDoUpdate3DModelOG = 114457;
-    constexpr std::uint64_t kDoUpdate3DModelNG = 2232144;
-
-    using Args = RE::BSModelDB::DBTraits::ArgsType;
-    using Demand1Fn = RE::BSResource::ErrorCode (*)(const char*, RE::BSModelDB::Handle&, const Args&);
-    using Demand2Fn = RE::BSResource::ErrorCode (*)(const char*, RE::NiPointer<RE::NiNode>*, const Args&);
-
-    Demand1Fn g_originalDemand1 = nullptr;
-    Demand2Fn g_originalDemand2 = nullptr;
-
-    std::atomic_bool g_redirectWindow{ false };
-    std::atomic_uint32_t g_faceRedirects{ 0 };
-    std::atomic_uint32_t g_rearRedirects{ 0 };
     std::atomic_bool g_appliedThisLoad{ false };
+    std::atomic_bool g_loggedSourceFailure{ false };
 
-    [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
+    RE::NiPointer<RE::NiNode> g_faceSourceRoot;
+    RE::NiPointer<RE::NiNode> g_rearSourceRoot;
+    RE::NiPointer<RE::NiAVObject> g_faceSourceShape;
+    RE::NiPointer<RE::NiAVObject> g_rearSourceShape;
+    RE::NiPointer<RE::NiAVObject> g_oldPlayerFaceShape;
+    RE::NiPointer<RE::NiAVObject> g_oldPlayerRearShape;
+
+    [[nodiscard]] const char* RTTIName(RE::NiAVObject* a_object)
     {
-        const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
-        return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
+        if (!a_object) {
+            return "<null>";
+        }
+        const auto* rtti = a_object->GetRTTI();
+        return rtti && rtti->GetName() ? rtti->GetName() : "<no-rtti>";
     }
 
-    [[nodiscard]] bool EndsWithI(const char* a_value, const char* a_suffix)
+    [[nodiscard]] bool IsDynamicTriShape(RE::NiAVObject* a_object)
     {
-        if (!a_value || !a_suffix) {
-            return false;
-        }
-
-        const auto valueLen = std::strlen(a_value);
-        const auto suffixLen = std::strlen(a_suffix);
-        if (valueLen < suffixLen) {
-            return false;
-        }
-
-        return _stricmp(a_value + valueLen - suffixLen, a_suffix) == 0;
+        return a_object && _stricmp(RTTIName(a_object), kDynamicRTTIName) == 0;
     }
 
-    [[nodiscard]] const char* RedirectPath(const char* a_name, const Args& a_args)
+    RE::NiAVObject* FindFirstDynamicShape(RE::NiAVObject* a_object)
     {
-        if (!a_name || !g_redirectWindow.load(std::memory_order_acquire) || !a_args.faceGenModel) {
-            return a_name;
+        if (!a_object) {
+            return nullptr;
         }
 
-        if (EndsWithI(a_name, kVanillaFaceSuffix)) {
-            const auto hit = ++g_faceRedirects;
-            REX::INFO("RUN14 redirect FACE request #{}: {} -> {}", hit, a_name, kCustomFace);
-            return kCustomFace;
+        if (IsDynamicTriShape(a_object)) {
+            return a_object;
         }
 
-        if (EndsWithI(a_name, kVanillaRearSuffix)) {
-            const auto hit = ++g_rearRedirects;
-            REX::INFO("RUN14 redirect REAR request #{}: {} -> {}", hit, a_name, kCustomRear);
-            return kCustomRear;
+        auto* node = netimmerse_cast<RE::NiNode*>(a_object);
+        if (!node) {
+            return nullptr;
         }
 
-        return a_name;
-    }
-
-    RE::BSResource::ErrorCode Demand1Hook(const char* a_name, RE::BSModelDB::Handle& a_result, const Args& a_args)
-    {
-        return g_originalDemand1(RedirectPath(a_name, a_args), a_result, a_args);
-    }
-
-    RE::BSResource::ErrorCode Demand2Hook(const char* a_name, RE::NiPointer<RE::NiNode>* a_result, const Args& a_args)
-    {
-        return g_originalDemand2(RedirectPath(a_name, a_args), a_result, a_args);
-    }
-
-    [[nodiscard]] bool InstallModelHooks()
-    {
-        const auto init = MH_Initialize();
-        if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
-            REX::ERROR("RUN14 MH_Initialize failed: {}", static_cast<int>(init));
-            return false;
-        }
-
-        REL::Relocation<std::uintptr_t> demand1{ RE::ID::BSModelDB::Demand1 };
-        REL::Relocation<std::uintptr_t> demand2{ RE::ID::BSModelDB::Demand2 };
-
-        const auto create1 = MH_CreateHook(
-            reinterpret_cast<LPVOID>(demand1.address()),
-            reinterpret_cast<LPVOID>(&Demand1Hook),
-            reinterpret_cast<LPVOID*>(&g_originalDemand1));
-        if (create1 != MH_OK && create1 != MH_ERROR_ALREADY_CREATED) {
-            REX::ERROR("RUN14 MH_CreateHook Demand1 failed: {}", static_cast<int>(create1));
-            return false;
-        }
-
-        const auto create2 = MH_CreateHook(
-            reinterpret_cast<LPVOID>(demand2.address()),
-            reinterpret_cast<LPVOID>(&Demand2Hook),
-            reinterpret_cast<LPVOID*>(&g_originalDemand2));
-        if (create2 != MH_OK && create2 != MH_ERROR_ALREADY_CREATED) {
-            REX::ERROR("RUN14 MH_CreateHook Demand2 failed: {}", static_cast<int>(create2));
-            return false;
-        }
-
-        const auto enable = MH_EnableHook(MH_ALL_HOOKS);
-        if (enable != MH_OK && enable != MH_ERROR_ENABLED) {
-            REX::ERROR("RUN14 MH_EnableHook failed: {}", static_cast<int>(enable));
-            return false;
-        }
-
-        REX::INFO(
-            "RUN14 BSModelDB MinHook detours installed. Demand1={} Demand2={}",
-            reinterpret_cast<const void*>(demand1.address()),
-            reinterpret_cast<const void*>(demand2.address()));
-        return true;
-    }
-
-    [[nodiscard]] RE::BGSHeadPart* FindPartByType(
-        std::span<RE::BGSHeadPart*> a_parts,
-        RE::BGSHeadPart::HeadPartType a_type)
-    {
-        for (auto* part : a_parts) {
-            if (part && part->type == a_type) {
-                return part;
+        for (auto& child : node->children) {
+            if (!child) {
+                continue;
+            }
+            if (auto* found = FindFirstDynamicShape(child.get())) {
+                return found;
             }
         }
         return nullptr;
     }
 
-    // RUN14 deliberately does NOT require an already-built 3D/FaceNode here.
-    // RUN13 did, which created a circular dependency: if the shared chargen mesh
-    // was absent or not yet loaded, the redirect window could never arm.
-    [[nodiscard]] bool PlayerFemaleHeadMetadataReady(RE::PlayerCharacter* a_player)
+    [[nodiscard]] bool LoadPrivateFaceGenModel(const char* a_path, RE::NiPointer<RE::NiNode>& a_root)
     {
-        if (!a_player) {
-            return false;
-        }
-
-        auto* npc = a_player->GetNPC();
-        if (!npc) {
-            return false;
-        }
-
-        auto active = npc->GetHeadParts(true);
-        auto* face = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kFace);
-        auto* rear = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kHeadRear);
-        if (!face || !rear) {
-            return false;
-        }
-
-        const auto* faceCG = face->ChargenModel.GetModel();
-        const auto* rearCG = rear->ChargenModel.GetModel();
-        const bool femaleFace = faceCG && EndsWithI(faceCG, kVanillaFaceSuffix);
-        const bool femaleRear = rearCG && EndsWithI(rearCG, kVanillaRearSuffix);
-
-        if (!femaleFace || !femaleRear) {
-            REX::INFO(
-                "RUN14 waiting for female player head metadata. faceCG={} rearCG={}",
-                faceCG ? faceCG : "<null>",
-                rearCG ? rearCG : "<null>");
-        }
-        return femaleFace && femaleRear;
-    }
-
-    bool RebuildPlayerHeadWithRedirect()
-    {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!PlayerFemaleHeadMetadataReady(player) || !player->currentProcess) {
-            return false;
-        }
-
-        if (g_appliedThisLoad.exchange(true)) {
+        if (a_root) {
             return true;
         }
 
-        g_faceRedirects.store(0);
-        g_rearRedirects.store(0);
-        g_redirectWindow.store(true, std::memory_order_release);
+        RE::BSModelDB::DBTraits::ArgsType args{};
+        args.loadLevel = 0;
+        args.prepareAfterLoad = 1;
+        args.faceGenModel = 1;
+        args.useErrorMarker = 0;
+        args.performProcess = 1;
+        args.createFadeNode = 0;
+        args.loadTextures = 1;
 
-        constexpr auto kHeadFaceFlags = static_cast<RE::RESET_3D_FLAGS>(
-            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kHead) |
-            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kFace));
+        const auto result = RE::BSModelDB::Demand(a_path, std::addressof(a_root), args);
+        if (result == RE::BSResource::ErrorCode::kBusy) {
+            return false;
+        }
 
-        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kHead);
-        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kFace);
-
-        using Update3DFn = void (*)(RE::AIProcess*, RE::Actor*, RE::RESET_3D_FLAGS);
-        const auto id = GetDoUpdate3DModelID();
-        REL::Relocation<Update3DFn> doUpdate3D{ REL::ID(id) };
+        if (result != RE::BSResource::ErrorCode::kNone || !a_root) {
+            if (!g_loggedSourceFailure.exchange(true)) {
+                REX::ERROR(
+                    "RUN15 failed to load private FaceGen model. path={} error={} root={}",
+                    a_path,
+                    static_cast<std::uint32_t>(result),
+                    static_cast<const void*>(a_root.get()));
+            }
+            return false;
+        }
 
         REX::INFO(
-            "RUN14 starting PLAYER-only head rebuild BEFORE face-node readiness; redirect window ARMED. relocation={} existing3D={} existingFaceNode={}",
-            id,
-            static_cast<const void*>(player->Get3D()),
-            static_cast<const void*>(player->GetFaceNodeSkinned()));
-
-        doUpdate3D(player->currentProcess, static_cast<RE::Actor*>(player), kHeadFaceFlags);
-
-        REX::INFO(
-            "RUN14 DoUpdate3DModel returned. faceRedirects={} rearRedirects={}",
-            g_faceRedirects.load(),
-            g_rearRedirects.load());
-
+            "RUN15 private FaceGen model loaded. path={} root={} rootType={}",
+            a_path,
+            static_cast<const void*>(a_root.get()),
+            RTTIName(a_root.get()));
         return true;
     }
 
-    void QueueCloseWindow(std::uint32_t a_ticks)
+    [[nodiscard]] bool FindDirectChildIndex(RE::NiNode* a_parent, RE::NiAVObject* a_child, std::uint16_t& a_index)
     {
-        const auto* tasks = F4SE::GetTaskInterface();
-        if (!tasks) {
-            g_redirectWindow.store(false, std::memory_order_release);
+        if (!a_parent || !a_child) {
+            return false;
+        }
+
+        for (std::uint16_t i = 0; i < a_parent->children.capacity(); ++i) {
+            auto& slot = a_parent->children[i];
+            if (slot && slot.get() == a_child) {
+                a_index = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void CopyPlayerBindingAndMaterial(RE::NiAVObject* a_source, RE::NiAVObject* a_target)
+    {
+        a_source->name = a_target->name;
+        a_source->local = a_target->local;
+        a_source->world = a_target->world;
+        a_source->previousWorld = a_target->previousWorld;
+        a_source->worldBound = a_target->worldBound;
+        a_source->flags = a_target->flags;
+        a_source->userData = a_target->userData;
+        a_source->fadeAmount = a_target->fadeAmount;
+        a_source->multType = a_target->multType;
+        a_source->meshLODFadingLevel = a_target->meshLODFadingLevel;
+        a_source->currentMeshLODLevel = a_target->currentMeshLODLevel;
+        a_source->previousMeshLODLevel = a_target->previousMeshLODLevel;
+
+        auto* sourceGeometry = netimmerse_cast<RE::BSGeometry*>(a_source);
+        auto* targetGeometry = netimmerse_cast<RE::BSGeometry*>(a_target);
+        if (!sourceGeometry || !targetGeometry) {
             return;
         }
 
-        tasks->AddTask([a_ticks]() {
-            if (a_ticks > 1) {
-                QueueCloseWindow(a_ticks - 1);
-                return;
-            }
+        // Preserve the player's already-working FaceGen material/tint and skeleton binding.
+        // Only renderer geometry comes from the private NIF.
+        sourceGeometry->properties[0] = targetGeometry->properties[0];
+        sourceGeometry->properties[1] = targetGeometry->properties[1];
+        sourceGeometry->skinInstance = targetGeometry->skinInstance;
+        sourceGeometry->registered = targetGeometry->registered;
+    }
 
-            g_redirectWindow.store(false, std::memory_order_release);
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            auto* faceNode = player ? player->GetFaceNodeSkinned() : nullptr;
-            REX::INFO(
-                "RUN14 redirect window CLOSED. faceRedirects={} rearRedirects={} faceNode={}",
-                g_faceRedirects.load(),
-                g_rearRedirects.load(),
-                static_cast<const void*>(faceNode));
-        });
+    [[nodiscard]] bool TryGraftPlayerRenderedHead()
+    {
+        if (g_appliedThisLoad.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* faceNode = player ? player->GetFaceNodeSkinned() : nullptr;
+        if (!player || !player->Get3D() || !faceNode) {
+            return false;
+        }
+
+        auto* targetFace = faceNode->GetObjectByName(RE::BSFixedString(kTargetFaceName));
+        auto* targetRear = faceNode->GetObjectByName(RE::BSFixedString(kTargetRearName));
+        if (!targetFace || !targetRear) {
+            return false;
+        }
+
+        if (!IsDynamicTriShape(targetFace) || !IsDynamicTriShape(targetRear)) {
+            REX::ERROR(
+                "RUN15 player target shapes are not dynamic. face={} type={} rear={} type={}",
+                static_cast<const void*>(targetFace),
+                RTTIName(targetFace),
+                static_cast<const void*>(targetRear),
+                RTTIName(targetRear));
+            return false;
+        }
+
+        if (!LoadPrivateFaceGenModel(kCustomFace, g_faceSourceRoot) ||
+            !LoadPrivateFaceGenModel(kCustomRear, g_rearSourceRoot)) {
+            return false;
+        }
+
+        auto* sourceFace = FindFirstDynamicShape(g_faceSourceRoot.get());
+        auto* sourceRear = FindFirstDynamicShape(g_rearSourceRoot.get());
+        if (!sourceFace || !sourceRear) {
+            if (!g_loggedSourceFailure.exchange(true)) {
+                REX::ERROR(
+                    "RUN15 private models did not produce BSDynamicTriShape. faceSource={} rearSource={}",
+                    static_cast<const void*>(sourceFace),
+                    static_cast<const void*>(sourceRear));
+            }
+            return false;
+        }
+
+        std::uint16_t faceIndex = 0;
+        std::uint16_t rearIndex = 0;
+        if (!FindDirectChildIndex(faceNode, targetFace, faceIndex) ||
+            !FindDirectChildIndex(faceNode, targetRear, rearIndex)) {
+            REX::ERROR("RUN15 target face/rear were not direct children of the player's FaceGen node");
+            return false;
+        }
+
+        // Hold every object before detaching/swapping so no outside FaceGen pointer can dangle.
+        g_faceSourceShape.reset(sourceFace);
+        g_rearSourceShape.reset(sourceRear);
+        g_oldPlayerFaceShape.reset(targetFace);
+        g_oldPlayerRearShape.reset(targetRear);
+
+        CopyPlayerBindingAndMaterial(sourceFace, targetFace);
+        CopyPlayerBindingAndMaterial(sourceRear, targetRear);
+
+        if (sourceFace->parent) {
+            sourceFace->parent->DetachChild(sourceFace);
+        }
+        if (sourceRear->parent) {
+            sourceRear->parent->DetachChild(sourceRear);
+        }
+
+        faceNode->SetAt(faceIndex, sourceFace);
+        faceNode->SetAt(rearIndex, sourceRear);
+
+        sourceFace->PostAttachUpdate();
+        sourceRear->PostAttachUpdate();
+        sourceFace->UpdateWorldBound();
+        sourceRear->UpdateWorldBound();
+
+        g_appliedThisLoad.store(true, std::memory_order_release);
+
+        REX::INFO(
+            "RUN15 PLAYER rendered-head graft APPLIED. faceNode={} faceIndex={} oldFace={} newFace={} newFaceType={} rearIndex={} oldRear={} newRear={} newRearType={}",
+            static_cast<const void*>(faceNode),
+            faceIndex,
+            static_cast<const void*>(targetFace),
+            static_cast<const void*>(sourceFace),
+            RTTIName(sourceFace),
+            rearIndex,
+            static_cast<const void*>(targetRear),
+            static_cast<const void*>(sourceRear),
+            RTTIName(sourceRear));
+        REX::INFO("RUN15 did not modify HeadPart records, FaceGen texture paths, materials on disk, or any NPC actor.");
+        return true;
     }
 
     void QueueApply(std::uint32_t a_attempts)
     {
         const auto* tasks = F4SE::GetTaskInterface();
         if (!tasks) {
-            if (RebuildPlayerHeadWithRedirect()) {
-                QueueCloseWindow(4);
-            }
             return;
         }
 
         tasks->AddTask([a_attempts]() {
-            if (RebuildPlayerHeadWithRedirect()) {
-                QueueCloseWindow(4);
-            } else if (a_attempts > 1) {
+            if (TryGraftPlayerRenderedHead()) {
+                return;
+            }
+
+            if (a_attempts > 1) {
                 QueueApply(a_attempts - 1);
+            } else {
+                REX::ERROR("RUN15 timed out waiting for the player's final female FaceGen node");
             }
         });
+    }
+
+    void ResetForLoad()
+    {
+        g_appliedThisLoad.store(false, std::memory_order_release);
+        g_loggedSourceFailure.store(false, std::memory_order_release);
+        g_faceSourceShape.reset();
+        g_rearSourceShape.reset();
+        g_oldPlayerFaceShape.reset();
+        g_oldPlayerRearShape.reset();
+        g_faceSourceRoot.reset();
+        g_rearSourceRoot.reset();
+        QueueApply(1800);
     }
 
     void MessageHandler(F4SE::MessagingInterface::Message* a_message)
@@ -264,8 +280,7 @@ namespace
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
-            g_appliedThisLoad.store(false);
-            QueueApply(120);
+            ResetForLoad();
             break;
         default:
             break;
@@ -277,21 +292,15 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
 
-    if (!InstallModelHooks()) {
+    const auto messaging = F4SE::GetMessagingInterface();
+    const auto tasks = F4SE::GetTaskInterface();
+    if (!messaging || !tasks) {
         return false;
     }
 
-    if (const auto messaging = F4SE::GetMessagingInterface()) {
-        messaging->RegisterListener(MessageHandler);
-    } else {
-        return false;
-    }
-
-    if (!F4SE::GetTaskInterface()) {
-        return false;
-    }
+    messaging->RegisterListener(MessageHandler);
 
     REX::INFO(
-        "ABDOSAPlayerHead RUN14 loaded; early PLAYER head FaceGen redirect. No HeadPart records or texture paths are modified.");
+        "ABDOSAPlayerHead RUN15 loaded; POST-BUILD PLAYER rendered-head graft. No BSModelDB detour, no HeadPart duplication, no texture-path edits.");
     return true;
 }
