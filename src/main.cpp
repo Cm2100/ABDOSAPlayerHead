@@ -30,9 +30,11 @@ namespace
 
     using Delta3 = std::array<float, 3>;
 
-    std::atomic_uint32_t g_generation{ 0 };
     std::atomic_bool g_loggedFailure{ false };
-    std::atomic_uint64_t g_patchFrames{ 0 };
+    std::atomic_bool g_armForLoad{ false };
+    std::atomic_bool g_taskQueued{ false };
+    std::atomic_bool g_appliedThisLoad{ false };
+    std::atomic_bool g_menuSinkRegistered{ false };
 
     RE::NiPointer<RE::NiNode> g_customFaceRoot;
     RE::NiPointer<RE::NiNode> g_customRearRoot;
@@ -41,11 +43,6 @@ namespace
 
     std::vector<Delta3> g_faceDelta;
     std::vector<Delta3> g_rearDelta;
-
-    RE::NiAVObject* g_lastTargetFace{ nullptr };
-    RE::NiAVObject* g_lastTargetRear{ nullptr };
-    std::uint64_t g_lastPatchedFaceHash{ 0 };
-    std::uint64_t g_lastPatchedRearHash{ 0 };
 
     [[nodiscard]] const char* RTTIName(RE::NiAVObject* a_object)
     {
@@ -185,6 +182,7 @@ namespace
         if (a_root) {
             return true;
         }
+
         RE::BSModelDB::DBTraits::ArgsType args{};
         args.loadLevel = 0;
         args.prepareAfterLoad = 1;
@@ -200,7 +198,7 @@ namespace
         }
         if (result != RE::BSResource::ErrorCode::kNone || !a_root) {
             if (!g_loggedFailure.exchange(true)) {
-                REX::ERROR("RUN16 model load failed. path={} error={} root={}",
+                REX::ERROR("RUN17 model load failed. path={} error={} root={}",
                     a_path, static_cast<std::uint32_t>(result), static_cast<const void*>(a_root.get()));
             }
             return false;
@@ -213,7 +211,7 @@ namespace
         const auto custom = GetDynamicView(a_custom);
         const auto vanilla = GetDynamicView(a_vanilla);
         if (!custom.data || !vanilla.data || custom.vertices != vanilla.vertices || custom.size != vanilla.size) {
-            REX::ERROR("RUN16 {} incompatible dynamic geometry. customVerts={} customSize={} vanillaVerts={} vanillaSize={}",
+            REX::ERROR("RUN17 {} incompatible dynamic geometry. customVerts={} customSize={} vanillaVerts={} vanillaSize={}",
                 a_label, custom.vertices, custom.size, vanilla.vertices, vanilla.size);
             return false;
         }
@@ -234,13 +232,13 @@ namespace
             }
         }
 
-        REX::INFO("RUN16 {} delta ready. vertices={} bytes={} maxAbsDelta={} meanAbsDelta={} customHash={:016X} vanillaHash={:016X}",
+        REX::INFO("RUN17 {} delta ready. vertices={} bytes={} maxAbsDelta={} meanAbsDelta={} customHash={:016X} vanillaHash={:016X}",
             a_label, custom.vertices, custom.size, maxDelta,
             static_cast<float>(sumDelta / (static_cast<double>(custom.vertices) * 3.0)),
             HashBytes(custom.data, custom.size), HashBytes(vanilla.data, vanilla.size));
 
         if (maxDelta < 0.0001f) {
-            REX::ERROR("RUN16 {} custom-vs-vanilla delta is effectively ZERO; refusing to patch", a_label);
+            REX::ERROR("RUN17 {} custom-vs-vanilla delta is effectively ZERO; refusing to patch", a_label);
             return false;
         }
         return true;
@@ -251,6 +249,7 @@ namespace
         if (!g_faceDelta.empty() && !g_rearDelta.empty()) {
             return true;
         }
+
         if (!LoadFaceGenModel(kCustomFace, g_customFaceRoot) ||
             !LoadFaceGenModel(kCustomRear, g_customRearRoot) ||
             !LoadFaceGenModel(kVanillaFace, g_vanillaFaceRoot) ||
@@ -264,7 +263,7 @@ namespace
         auto* vanillaRear = FindFirstDynamicShape(g_vanillaRearRoot.get());
         if (!customFace || !customRear || !vanillaFace || !vanillaRear) {
             if (!g_loggedFailure.exchange(true)) {
-                REX::ERROR("RUN16 could not resolve all four dynamic source geometries");
+                REX::ERROR("RUN17 could not resolve all four dynamic source geometries");
             }
             return false;
         }
@@ -275,27 +274,22 @@ namespace
             !BuildDelta(customRear, vanillaRear, rearDelta, "REAR")) {
             return false;
         }
+
         g_faceDelta = std::move(faceDelta);
         g_rearDelta = std::move(rearDelta);
         return true;
     }
 
-    [[nodiscard]] bool PatchOne(RE::NiAVObject* a_target, const std::vector<Delta3>& a_delta, std::uint64_t& a_lastPatchedHash, const char* a_label)
+    [[nodiscard]] bool PatchOneOnce(RE::NiAVObject* a_target, const std::vector<Delta3>& a_delta, const char* a_label)
     {
         auto view = GetDynamicView(a_target);
         if (!view.data || view.vertices != a_delta.size()) {
-            if (!g_loggedFailure.exchange(true)) {
-                REX::ERROR("RUN16 {} target mismatch. targetVerts={} targetSize={} deltaVerts={}",
-                    a_label, view.vertices, view.size, a_delta.size());
-            }
+            REX::ERROR("RUN17 {} target mismatch. targetVerts={} targetSize={} deltaVerts={}",
+                a_label, view.vertices, view.size, a_delta.size());
             return false;
         }
 
         const auto beforeHash = HashBytes(view.data, view.size);
-        if (beforeHash == a_lastPatchedHash) {
-            return true;
-        }
-
         for (std::uint16_t i = 0; i < view.vertices; ++i) {
             auto* p = view.data + static_cast<std::uint32_t>(i) * kExpectedDynamicStride;
             for (int axis = 0; axis < 3; ++axis) {
@@ -304,76 +298,128 @@ namespace
                 *h = FloatToHalf(current + a_delta[i][axis]);
             }
         }
-        a_lastPatchedHash = HashBytes(view.data, view.size);
+        const auto afterHash = HashBytes(view.data, view.size);
+        REX::INFO("RUN17 {} one-shot patch. before={:016X} after={:016X}", a_label, beforeHash, afterHash);
+        return beforeHash != afterHash;
+    }
+
+    [[nodiscard]] bool ApplyPlayerDeltaOnce()
+    {
+        if (g_appliedThisLoad.load(std::memory_order_acquire)) {
+            return true;
+        }
+        if (!PrepareDeltas()) {
+            return false;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* rawFaceNode = player ? player->GetFaceNodeSkinned() : nullptr;
+        if (!player || !player->Get3D() || !rawFaceNode) {
+            REX::INFO("RUN17 player FaceGen node not ready at one-shot trigger");
+            return false;
+        }
+
+        auto* faceNode = reinterpret_cast<RE::NiNode*>(rawFaceNode);
+        auto* targetFace = faceNode->GetObjectByName(RE::BSFixedString(kTargetFaceName));
+        auto* targetRear = faceNode->GetObjectByName(RE::BSFixedString(kTargetRearName));
+        if (!targetFace || !targetRear || !IsDynamicTriShape(targetFace) || !IsDynamicTriShape(targetRear)) {
+            REX::INFO("RUN17 player dynamic head shapes not ready at one-shot trigger");
+            return false;
+        }
+
+        const bool faceOK = PatchOneOnce(targetFace, g_faceDelta, "FACE");
+        const bool rearOK = PatchOneOnce(targetRear, g_rearDelta, "REAR");
+        if (!faceOK || !rearOK) {
+            return false;
+        }
+
+        g_appliedThisLoad.store(true, std::memory_order_release);
+        REX::INFO("RUN17 PLAYER one-shot in-place sculpt delta APPLIED. face={} rear={}",
+            static_cast<const void*>(targetFace), static_cast<const void*>(targetRear));
         return true;
     }
 
-    void QueueFramePatch(std::uint32_t a_generation)
+    void QueueOneShot(const char* a_reason)
     {
-        const auto* tasks = F4SE::GetTaskInterface();
-        if (!tasks) {
+        if (!g_armForLoad.load(std::memory_order_acquire) || g_appliedThisLoad.load(std::memory_order_acquire)) {
             return;
         }
-        tasks->AddTask([a_generation]() {
-            if (a_generation != g_generation.load(std::memory_order_acquire)) {
-                return;
-            }
+        if (g_taskQueued.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
 
-            if (!PrepareDeltas()) {
-                QueueFramePatch(a_generation);
-                return;
-            }
+        const auto* tasks = F4SE::GetTaskInterface();
+        if (!tasks) {
+            g_taskQueued.store(false, std::memory_order_release);
+            return;
+        }
 
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            auto* rawFaceNode = player ? player->GetFaceNodeSkinned() : nullptr;
-            if (!player || !player->Get3D() || !rawFaceNode) {
-                QueueFramePatch(a_generation);
-                return;
+        REX::INFO("RUN17 queueing ONE task after {}", a_reason ? a_reason : "menu event");
+        tasks->AddTask([]() {
+            const bool ok = ApplyPlayerDeltaOnce();
+            g_taskQueued.store(false, std::memory_order_release);
+            if (ok) {
+                g_armForLoad.store(false, std::memory_order_release);
+            } else {
+                REX::INFO("RUN17 one-shot was not ready; no recursion/requeue performed");
             }
-
-            auto* faceNode = reinterpret_cast<RE::NiNode*>(rawFaceNode);
-            auto* targetFace = faceNode->GetObjectByName(RE::BSFixedString(kTargetFaceName));
-            auto* targetRear = faceNode->GetObjectByName(RE::BSFixedString(kTargetRearName));
-            if (!targetFace || !targetRear || !IsDynamicTriShape(targetFace) || !IsDynamicTriShape(targetRear)) {
-                QueueFramePatch(a_generation);
-                return;
-            }
-
-            if (targetFace != g_lastTargetFace) {
-                g_lastTargetFace = targetFace;
-                g_lastPatchedFaceHash = 0;
-                REX::INFO("RUN16 PLAYER face target acquired: {}", static_cast<const void*>(targetFace));
-            }
-            if (targetRear != g_lastTargetRear) {
-                g_lastTargetRear = targetRear;
-                g_lastPatchedRearHash = 0;
-                REX::INFO("RUN16 PLAYER rear target acquired: {}", static_cast<const void*>(targetRear));
-            }
-
-            const bool faceOK = PatchOne(targetFace, g_faceDelta, g_lastPatchedFaceHash, "FACE");
-            const bool rearOK = PatchOne(targetRear, g_rearDelta, g_lastPatchedRearHash, "REAR");
-            if (faceOK && rearOK) {
-                const auto frame = ++g_patchFrames;
-                if (frame == 1 || frame == 2 || frame == 3 || (frame % 600) == 0) {
-                    REX::INFO("RUN16 PLAYER in-place sculpt delta active. frame={} faceHash={:016X} rearHash={:016X}",
-                        frame, g_lastPatchedFaceHash, g_lastPatchedRearHash);
-                }
-            }
-
-            QueueFramePatch(a_generation);
         });
     }
 
-    void ResetForLoad()
+    class MenuSink final : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
     {
-        const auto generation = ++g_generation;
-        g_loggedFailure.store(false);
-        g_patchFrames.store(0);
-        g_lastTargetFace = nullptr;
-        g_lastTargetRear = nullptr;
-        g_lastPatchedFaceHash = 0;
-        g_lastPatchedRearHash = 0;
-        QueueFramePatch(generation);
+    public:
+        RE::BSEventNotifyControl ProcessEvent(
+            const RE::MenuOpenCloseEvent& a_event,
+            RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+        {
+            if (!g_armForLoad.load(std::memory_order_acquire) || g_appliedThisLoad.load(std::memory_order_acquire)) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            const auto* name = a_event.menuName.c_str();
+            if (!name) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            // Primary trigger: world loading screen has closed.
+            if (!a_event.opening && _stricmp(name, "LoadingMenu") == 0) {
+                QueueOneShot("LoadingMenu close");
+            }
+            // Fallback trigger if the first task ran slightly too early.
+            else if (a_event.opening && _stricmp(name, "HUDMenu") == 0) {
+                QueueOneShot("HUDMenu open");
+            }
+            // Manual safe retry opportunity without any loop.
+            else if (!a_event.opening && (_stricmp(name, "PauseMenu") == 0 || _stricmp(name, "PipboyMenu") == 0)) {
+                QueueOneShot("later menu close");
+            }
+
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    MenuSink g_menuSink;
+
+    void RegisterMenuSink()
+    {
+        if (g_menuSinkRegistered.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (auto* ui = RE::UI::GetSingleton()) {
+            ui->GetEventSource<RE::MenuOpenCloseEvent>()->RegisterSink(&g_menuSink);
+            g_menuSinkRegistered.store(true, std::memory_order_release);
+            REX::INFO("RUN17 MenuOpenCloseEvent sink registered");
+        }
+    }
+
+    void ArmForCurrentLoad()
+    {
+        g_loggedFailure.store(false, std::memory_order_release);
+        g_taskQueued.store(false, std::memory_order_release);
+        g_appliedThisLoad.store(false, std::memory_order_release);
+        g_armForLoad.store(true, std::memory_order_release);
+        REX::INFO("RUN17 armed; waiting for LoadingMenu close/HUDMenu open. No task loop exists.");
     }
 
     void MessageHandler(F4SE::MessagingInterface::Message* a_message)
@@ -381,10 +427,15 @@ namespace
         if (!a_message) {
             return;
         }
+
         switch (a_message->type) {
+        case F4SE::MessagingInterface::kGameDataReady:
+            RegisterMenuSink();
+            break;
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
-            ResetForLoad();
+            RegisterMenuSink();
+            ArmForCurrentLoad();
             break;
         default:
             break;
@@ -395,12 +446,14 @@ namespace
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
+
     const auto messaging = F4SE::GetMessagingInterface();
     const auto tasks = F4SE::GetTaskInterface();
     if (!messaging || !tasks) {
         return false;
     }
+
     messaging->RegisterListener(MessageHandler);
-    REX::INFO("ABDOSAPlayerHead RUN16 loaded; PLAYER-only in-place FaceGen vertex-delta patch. No HeadPart, model-path, texture, material, body, or NPC edits.");
+    REX::INFO("ABDOSAPlayerHead RUN17 loaded; event-driven ONE-SHOT player FaceGen delta. No recursive task scheduling.");
     return true;
 }
