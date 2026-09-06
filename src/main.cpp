@@ -15,24 +15,34 @@ namespace
         return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
     }
 
+    void DumpHeadPart(const char* a_label, RE::BGSHeadPart* a_part)
+    {
+        if (!a_part) {
+            REX::INFO("{} <null>", a_label);
+            return;
+        }
+
+        REX::INFO(
+            "{} form={:08X} type={} flags={} model={} textureSet={} chargen={} morph0={} morph1={} morph2={}",
+            a_label,
+            a_part->GetFormID(),
+            static_cast<std::int32_t>(a_part->type.get()),
+            static_cast<std::uint32_t>(a_part->flags.underlying()),
+            a_part->GetModel() ? a_part->GetModel() : "<null-model>",
+            static_cast<const void*>(a_part->textureSet),
+            a_part->ChargenModel.GetModel() ? a_part->ChargenModel.GetModel() : "<null>",
+            a_part->morphs[0].GetModel() ? a_part->morphs[0].GetModel() : "<null>",
+            a_part->morphs[1].GetModel() ? a_part->morphs[1].GetModel() : "<null>",
+            a_part->morphs[2].GetModel() ? a_part->morphs[2].GetModel() : "<null>");
+    }
+
     void DumpHeadParts(const char* a_label, std::span<RE::BGSHeadPart*> a_parts)
     {
         REX::INFO("{} count={}", a_label, a_parts.size());
         std::size_t index = 0;
         for (auto* part : a_parts) {
-            if (!part) {
-                REX::INFO("{}[{}] <null>", a_label, index++);
-                continue;
-            }
-
-            const auto model = part->GetModel() ? part->GetModel() : "<null-model>";
-            REX::INFO(
-                "{}[{}] form={:08X} type={} model={}",
-                a_label,
-                index++,
-                part->GetFormID(),
-                static_cast<std::int32_t>(part->type.get()),
-                model);
+            const auto itemLabel = fmt::format("{}[{}]", a_label, index++);
+            DumpHeadPart(itemLabel.c_str(), part);
         }
     }
 
@@ -81,13 +91,36 @@ namespace
             return false;
         }
 
-        REX::INFO(
-            "Resolved PLAYER source parts by TYPE. face={:08X} model={} rear={:08X} model={}",
-            a_face->GetFormID(),
-            a_face->GetModel() ? a_face->GetModel() : "<null-model>",
-            a_rear->GetFormID(),
-            a_rear->GetModel() ? a_rear->GetModel() : "<null-model>");
+        DumpHeadPart("Resolved PLAYER FACE source", a_face);
+        DumpHeadPart("Resolved PLAYER REAR source", a_rear);
         return true;
+    }
+
+    void CopyHeadPartMetadata(RE::BGSHeadPart* a_duplicate, RE::BGSHeadPart* a_source)
+    {
+        // CreateDuplicateForm() did not preserve the BGSHeadPart-specific payload on this
+        // runtime. The old RUN9 log proved that: after replacing the player list, both
+        // private forms stopped matching Face/HeadRear TYPE. The same missing payload can
+        // also drop the texture set and produce a dark face. Copy every rendering/chargen
+        // field explicitly, then change ONLY the primary mesh path.
+        static_cast<RE::TESModel*>(a_duplicate)->CopyComponent(static_cast<RE::TESModel*>(a_source));
+        a_duplicate->swapForm = a_source->swapForm;
+        a_duplicate->colorRemappingIndex = a_source->colorRemappingIndex;
+
+        a_duplicate->flags = a_source->flags;
+        a_duplicate->type = a_source->type;
+        a_duplicate->extraParts = a_source->extraParts;
+        a_duplicate->textureSet = a_source->textureSet;
+
+        a_duplicate->ChargenModel.CopyComponent(&a_source->ChargenModel);
+        for (std::size_t i = 0; i < 3; ++i) {
+            a_duplicate->morphs[i].CopyComponent(&a_source->morphs[i]);
+        }
+
+        a_duplicate->colorForm = a_source->colorForm;
+        a_duplicate->validRaces = a_source->validRaces;
+        a_duplicate->chargenConditions.head = a_source->chargenConditions.head;
+        a_duplicate->formEditorID = a_source->formEditorID;
     }
 
     [[nodiscard]] RE::BGSHeadPart* DuplicateHeadPart(RE::BGSHeadPart* a_source, const char* a_model)
@@ -103,12 +136,19 @@ namespace
             return nullptr;
         }
 
+        CopyHeadPartMetadata(duplicate, a_source);
         duplicate->SetModel(a_model);
-        REX::INFO(
-            "Created private head part form={:08X} type={} model={}",
-            duplicate->GetFormID(),
-            static_cast<std::int32_t>(duplicate->type.get()),
-            duplicate->GetModel() ? duplicate->GetModel() : "<null-model>");
+
+        DumpHeadPart("Created metadata-preserving PRIVATE head part", duplicate);
+
+        if (duplicate->type != a_source->type || duplicate->textureSet != a_source->textureSet) {
+            REX::ERROR(
+                "PRIVATE head-part metadata mismatch after copy. typeOK={} textureOK={}",
+                duplicate->type == a_source->type,
+                duplicate->textureSet == a_source->textureSet);
+            return nullptr;
+        }
+
         return duplicate;
     }
 
@@ -125,10 +165,6 @@ namespace
             return false;
         }
 
-        REX::INFO(
-            "Player-only head parts ready. Face form {:08X}, rear form {:08X}",
-            g_playerFacePart->GetFormID(),
-            g_playerRearPart->GetFormID());
         return true;
     }
 
@@ -181,7 +217,7 @@ namespace
         const bool rearOK = base.rear || active.rear;
 
         REX::INFO(
-            "PLAYER head array patched by TYPE. base(face={},rear={}) active(face={},rear={})",
+            "PLAYER head array patched. base(face={},rear={}) active(face={},rear={})",
             base.face,
             base.rear,
             active.face,
@@ -189,7 +225,6 @@ namespace
 
         DumpHeadParts("PLAYER active AFTER", a_playerNPC->GetHeadParts(true));
         DumpHeadParts("PLAYER base AFTER", a_playerNPC->GetHeadParts(false));
-
         return faceOK && rearOK;
     }
 
@@ -210,11 +245,7 @@ namespace
         using update3d_t = void (*)(RE::AIProcess*, RE::Actor*, RE::RESET_3D_FLAGS);
         const auto id = GetDoUpdate3DModelID();
         REL::Relocation<update3d_t> doUpdate3D{ REL::ID(id) };
-
-        const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
-        REX::INFO(
-            "Rebuilding PLAYER head with private head-part forms; runtime={}.{}.{}.{} relocation ID {}",
-            runtime.major(), runtime.minor(), runtime.patch(), runtime.build(), id);
+        REX::INFO("Rebuilding PLAYER head; relocation ID {}", id);
         doUpdate3D(a_player->currentProcess, static_cast<RE::Actor*>(a_player), kHeadFaceFlags);
         return true;
     }
@@ -235,14 +266,12 @@ namespace
 
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
-                REX::ERROR("PLAYER vanished before delayed second rebuild");
                 return;
             }
 
             if (auto* npc = player->GetNPC()) {
                 DumpHeadParts("PLAYER active BEFORE SECOND REBUILD", npc->GetHeadParts(true));
             }
-            REX::INFO("Executing delayed SECOND PLAYER head rebuild");
             RebuildPlayerHead(player);
         });
     }
@@ -251,18 +280,16 @@ namespace
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player || !player->currentProcess) {
-            REX::WARN("Player or AIProcess not ready");
             return false;
         }
 
         auto* playerNPC = player->GetNPC();
         if (!playerNPC) {
-            REX::ERROR("Could not resolve Player NPC base");
             return false;
         }
 
         REX::INFO(
-            "Applying player-only head split. Player actor={:08X}, Player NPC={:08X}, alternateList={}",
+            "Applying RUN11. Player actor={:08X}, Player NPC={:08X}, alternateList={}",
             player->GetFormID(),
             playerNPC->GetFormID(),
             playerNPC->UsingAlternateHeadPartList());
@@ -278,17 +305,13 @@ namespace
         }
 
         if (!AssignPlayerOnlyHeadParts(playerNPC)) {
-            REX::ERROR("Player NPC head-part arrays did not expose both Face and HeadRear types");
             return false;
         }
 
-        REX::INFO("PLAYER owns private Face/HeadRear parts; all NPC head-part records untouched");
         if (!RebuildPlayerHead(player)) {
             return false;
         }
 
-        // The private pointers remain installed, so a second rebuild is safe and cannot
-        // leak to NPCs. It also covers any asynchronous/cache delay in the first rebuild.
         QueueSecondRebuild(2);
         return true;
     }
@@ -317,7 +340,6 @@ namespace
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
-            REX::INFO("Received load/new-game message type {}; queuing PLAYER head apply", a_message->type);
             QueueApply(30);
             break;
         default:
@@ -333,15 +355,13 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     if (const auto messaging = F4SE::GetMessagingInterface()) {
         messaging->RegisterListener(MessageHandler);
     } else {
-        REX::ERROR("F4SE messaging interface unavailable");
         return false;
     }
 
     if (!F4SE::GetTaskInterface()) {
-        REX::ERROR("F4SE task interface unavailable");
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead RUN10 loaded; diagnostics + delayed second rebuild armed");
+    REX::INFO("ABDOSAPlayerHead RUN11 loaded; metadata-preserving private HeadParts armed");
     return true;
 }
