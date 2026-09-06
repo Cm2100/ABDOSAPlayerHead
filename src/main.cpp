@@ -6,8 +6,40 @@ namespace
     constexpr auto kCustomFace = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\BaseFemaleHead_faceBones.nif";
     constexpr auto kCustomRear = "Actors\\Character\\CharacterAssets\\ABDOSAPlayerHead\\FemaleheadRear_faceBones.nif";
 
+    constexpr std::uint64_t kDoUpdate3DModelOG = 114457;
+    constexpr std::uint64_t kDoUpdate3DModelNG = 2232144;
+
     std::string g_faceOriginal;
     std::string g_rearOriginal;
+
+    [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
+    {
+        const auto runtime = REL::Module::get().version();
+        return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
+    }
+
+    bool RebuildPlayerHead(RE::PlayerCharacter* a_player)
+    {
+        if (!a_player || !a_player->currentProcess) {
+            REX::WARN("Player AIProcess is not ready; head rebuild deferred");
+            return false;
+        }
+
+        constexpr auto kHeadFaceFlags = static_cast<RE::RESET_3D_FLAGS>(
+            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kHead) |
+            static_cast<std::uint16_t>(RE::RESET_3D_FLAGS::kFace));
+
+        a_player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kHead);
+        a_player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kFace);
+
+        using update3d_t = void (*)(RE::AIProcess*, RE::Actor*, RE::RESET_3D_FLAGS);
+        const auto id = GetDoUpdate3DModelID();
+        REL::Relocation<update3d_t> doUpdate3D{ REL::ID(id) };
+
+        REX::INFO("Calling synchronous DoUpdate3dModel relocation ID {}", id);
+        doUpdate3D(a_player->currentProcess, static_cast<RE::Actor*>(a_player), kHeadFaceFlags);
+        return true;
+    }
 
     bool ApplyToPlayer()
     {
@@ -33,24 +65,20 @@ namespace
             g_rearOriginal = rear->GetModel() ? rear->GetModel() : "";
         }
 
-        // Redirect only while the player's 3D rebuild is executed synchronously.
+        // Redirect only while the PLAYER'S head rebuild is executed synchronously.
+        // The global vanilla HDPT model paths are restored immediately afterwards,
+        // so NPCs keep using the vanilla front/rear head meshes.
         face->SetModel(kCustomFace);
         rear->SetModel(kCustomRear);
 
-        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kHead);
-        player->Set3DUpdateFlag(RE::RESET_3D_FLAGS::kFace);
-
-        if (player->currentProcess) {
-            player->currentProcess->Update3DModel(player);
-        } else {
-            REX::WARN("Player AIProcess is not ready; head rebuild deferred");
-            face->SetModel(g_faceOriginal.c_str());
-            rear->SetModel(g_rearOriginal.c_str());
-            return false;
-        }
+        const bool rebuilt = RebuildPlayerHead(player);
 
         face->SetModel(g_faceOriginal.c_str());
         rear->SetModel(g_rearOriginal.c_str());
+
+        if (!rebuilt) {
+            return false;
+        }
 
         REX::INFO("Applied custom front/rear head meshes to player and restored vanilla global paths");
         return true;
