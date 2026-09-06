@@ -39,7 +39,6 @@ namespace
         if (!a_object) {
             return nullptr;
         }
-
         if (IsDynamicTriShape(a_object)) {
             return a_object;
         }
@@ -50,11 +49,10 @@ namespace
         }
 
         for (auto& child : node->children) {
-            if (!child) {
-                continue;
-            }
-            if (auto* found = FindFirstDynamicShape(child.get())) {
-                return found;
+            if (child) {
+                if (auto* found = FindFirstDynamicShape(child.get())) {
+                    return found;
+                }
             }
         }
         return nullptr;
@@ -79,7 +77,6 @@ namespace
         if (result == RE::BSResource::ErrorCode::kBusy) {
             return false;
         }
-
         if (result != RE::BSResource::ErrorCode::kNone || !a_root) {
             if (!g_loggedSourceFailure.exchange(true)) {
                 REX::ERROR(
@@ -104,7 +101,6 @@ namespace
         if (!a_parent || !a_child) {
             return false;
         }
-
         for (std::uint16_t i = 0; i < a_parent->children.capacity(); ++i) {
             auto& slot = a_parent->children[i];
             if (slot && slot.get() == a_child) {
@@ -136,8 +132,6 @@ namespace
             return;
         }
 
-        // Preserve the player's already-working FaceGen material/tint and skeleton binding.
-        // Only renderer geometry comes from the private NIF.
         sourceGeometry->properties[0] = targetGeometry->properties[0];
         sourceGeometry->properties[1] = targetGeometry->properties[1];
         sourceGeometry->skinInstance = targetGeometry->skinInstance;
@@ -151,11 +145,14 @@ namespace
         }
 
         auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* faceNode = player ? player->GetFaceNodeSkinned() : nullptr;
-        if (!player || !player->Get3D() || !faceNode) {
+        auto* rawFaceNode = player ? player->GetFaceNodeSkinned() : nullptr;
+        if (!player || !player->Get3D() || !rawFaceNode) {
             return false;
         }
 
+        // CommonLibF4 forward-declares BSFaceGenNiNode here; its runtime base is NiNode.
+        // Work only through the NiNode interface so no FacePart/FaceGen record is touched.
+        auto* faceNode = reinterpret_cast<RE::NiNode*>(rawFaceNode);
         auto* targetFace = faceNode->GetObjectByName(RE::BSFixedString(kTargetFaceName));
         auto* targetRear = faceNode->GetObjectByName(RE::BSFixedString(kTargetRearName));
         if (!targetFace || !targetRear) {
@@ -165,10 +162,8 @@ namespace
         if (!IsDynamicTriShape(targetFace) || !IsDynamicTriShape(targetRear)) {
             REX::ERROR(
                 "RUN15 player target shapes are not dynamic. face={} type={} rear={} type={}",
-                static_cast<const void*>(targetFace),
-                RTTIName(targetFace),
-                static_cast<const void*>(targetRear),
-                RTTIName(targetRear));
+                static_cast<const void*>(targetFace), RTTIName(targetFace),
+                static_cast<const void*>(targetRear), RTTIName(targetRear));
             return false;
         }
 
@@ -197,7 +192,6 @@ namespace
             return false;
         }
 
-        // Hold every object before detaching/swapping so no outside FaceGen pointer can dangle.
         g_faceSourceShape.reset(sourceFace);
         g_rearSourceShape.reset(sourceRear);
         g_oldPlayerFaceShape.reset(targetFace);
@@ -224,16 +218,14 @@ namespace
         g_appliedThisLoad.store(true, std::memory_order_release);
 
         REX::INFO(
-            "RUN15 PLAYER rendered-head graft APPLIED. faceNode={} faceIndex={} oldFace={} newFace={} newFaceType={} rearIndex={} oldRear={} newRear={} newRearType={}",
-            static_cast<const void*>(faceNode),
-            faceIndex,
-            static_cast<const void*>(targetFace),
-            static_cast<const void*>(sourceFace),
-            RTTIName(sourceFace),
+            "RUN15 PLAYER rendered-head graft APPLIED. faceNode={} faceIndex={} oldFace={} newFace={} rearIndex={} oldRear={} newRear={}",
+            static_cast<const void*>(faceNode), faceIndex,
+            static_cast<const void*>(targetFace), static_cast<const void*>(sourceFace),
             rearIndex,
-            static_cast<const void*>(targetRear),
-            static_cast<const void*>(sourceRear),
-            RTTIName(sourceRear));
+            static_cast<const void*>(targetRear), static_cast<const void*>(sourceRear));
+        REX::INFO(
+            "RUN15 types: newFaceType={} newRearType={}",
+            RTTIName(sourceFace), RTTIName(sourceRear));
         REX::INFO("RUN15 did not modify HeadPart records, FaceGen texture paths, materials on disk, or any NPC actor.");
         return true;
     }
@@ -244,12 +236,10 @@ namespace
         if (!tasks) {
             return;
         }
-
         tasks->AddTask([a_attempts]() {
             if (TryGraftPlayerRenderedHead()) {
                 return;
             }
-
             if (a_attempts > 1) {
                 QueueApply(a_attempts - 1);
             } else {
@@ -276,7 +266,6 @@ namespace
         if (!a_message) {
             return;
         }
-
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
@@ -299,7 +288,6 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     }
 
     messaging->RegisterListener(MessageHandler);
-
     REX::INFO(
         "ABDOSAPlayerHead RUN15 loaded; POST-BUILD PLAYER rendered-head graft. No BSModelDB detour, no HeadPart duplication, no texture-path edits.");
     return true;
