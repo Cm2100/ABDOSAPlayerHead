@@ -47,7 +47,6 @@ namespace
         if (!node) {
             return nullptr;
         }
-
         for (auto& child : node->children) {
             if (child) {
                 if (auto* found = FindFirstDynamicShape(child.get())) {
@@ -79,20 +78,14 @@ namespace
         }
         if (result != RE::BSResource::ErrorCode::kNone || !a_root) {
             if (!g_loggedSourceFailure.exchange(true)) {
-                REX::ERROR(
-                    "RUN15 failed to load private FaceGen model. path={} error={} root={}",
-                    a_path,
-                    static_cast<std::uint32_t>(result),
-                    static_cast<const void*>(a_root.get()));
+                REX::ERROR("RUN15 private FaceGen load failed. path={} error={} root={}",
+                    a_path, static_cast<std::uint32_t>(result), static_cast<const void*>(a_root.get()));
             }
             return false;
         }
 
-        REX::INFO(
-            "RUN15 private FaceGen model loaded. path={} root={} rootType={}",
-            a_path,
-            static_cast<const void*>(a_root.get()),
-            RTTIName(a_root.get()));
+        REX::INFO("RUN15 private FaceGen loaded. path={} root={} rootType={}",
+            a_path, static_cast<const void*>(a_root.get()), RTTIName(a_root.get()));
         return true;
     }
 
@@ -109,6 +102,27 @@ namespace
             }
         }
         return false;
+    }
+
+    void CopySkinInstanceWithoutIncompleteType(RE::BSGeometry* a_source, RE::BSGeometry* a_target)
+    {
+        // CommonLibF4 currently forward-declares BSSkin::Instance in BSGeometry.h.
+        // The stored NiPointer is one pointer wide. Treat its pointee through the complete
+        // NiRefObject base to preserve reference counts without instantiating NiPointer<Instance> methods.
+        auto** sourceSlot = reinterpret_cast<RE::NiRefObject**>(std::addressof(a_source->skinInstance));
+        auto** targetSlot = reinterpret_cast<RE::NiRefObject**>(std::addressof(a_target->skinInstance));
+        auto* oldSkin = *sourceSlot;
+        auto* newSkin = *targetSlot;
+        if (oldSkin == newSkin) {
+            return;
+        }
+        if (newSkin) {
+            newSkin->IncRefCount();
+        }
+        *sourceSlot = newSkin;
+        if (oldSkin) {
+            oldSkin->DecRefCount();
+        }
     }
 
     void CopyPlayerBindingAndMaterial(RE::NiAVObject* a_source, RE::NiAVObject* a_target)
@@ -132,9 +146,10 @@ namespace
             return;
         }
 
+        // Keep the already-correct player skin shader/tint and player face-bone binding.
         sourceGeometry->properties[0] = targetGeometry->properties[0];
         sourceGeometry->properties[1] = targetGeometry->properties[1];
-        sourceGeometry->skinInstance = targetGeometry->skinInstance;
+        CopySkinInstanceWithoutIncompleteType(sourceGeometry, targetGeometry);
         sourceGeometry->registered = targetGeometry->registered;
     }
 
@@ -150,18 +165,14 @@ namespace
             return false;
         }
 
-        // CommonLibF4 forward-declares BSFaceGenNiNode here; its runtime base is NiNode.
-        // Work only through the NiNode interface so no FacePart/FaceGen record is touched.
         auto* faceNode = reinterpret_cast<RE::NiNode*>(rawFaceNode);
         auto* targetFace = faceNode->GetObjectByName(RE::BSFixedString(kTargetFaceName));
         auto* targetRear = faceNode->GetObjectByName(RE::BSFixedString(kTargetRearName));
         if (!targetFace || !targetRear) {
             return false;
         }
-
         if (!IsDynamicTriShape(targetFace) || !IsDynamicTriShape(targetRear)) {
-            REX::ERROR(
-                "RUN15 player target shapes are not dynamic. face={} type={} rear={} type={}",
+            REX::ERROR("RUN15 targets not dynamic. face={} type={} rear={} type={}",
                 static_cast<const void*>(targetFace), RTTIName(targetFace),
                 static_cast<const void*>(targetRear), RTTIName(targetRear));
             return false;
@@ -176,10 +187,8 @@ namespace
         auto* sourceRear = FindFirstDynamicShape(g_rearSourceRoot.get());
         if (!sourceFace || !sourceRear) {
             if (!g_loggedSourceFailure.exchange(true)) {
-                REX::ERROR(
-                    "RUN15 private models did not produce BSDynamicTriShape. faceSource={} rearSource={}",
-                    static_cast<const void*>(sourceFace),
-                    static_cast<const void*>(sourceRear));
+                REX::ERROR("RUN15 private models have no BSDynamicTriShape. faceSource={} rearSource={}",
+                    static_cast<const void*>(sourceFace), static_cast<const void*>(sourceRear));
             }
             return false;
         }
@@ -188,10 +197,11 @@ namespace
         std::uint16_t rearIndex = 0;
         if (!FindDirectChildIndex(faceNode, targetFace, faceIndex) ||
             !FindDirectChildIndex(faceNode, targetRear, rearIndex)) {
-            REX::ERROR("RUN15 target face/rear were not direct children of the player's FaceGen node");
+            REX::ERROR("RUN15 target face/rear are not direct children of PLAYER FaceGen node");
             return false;
         }
 
+        // Hold both old and new geometries so FaceGen/runtime references cannot dangle.
         g_faceSourceShape.reset(sourceFace);
         g_rearSourceShape.reset(sourceRear);
         g_oldPlayerFaceShape.reset(targetFace);
@@ -209,7 +219,6 @@ namespace
 
         faceNode->SetAt(faceIndex, sourceFace);
         faceNode->SetAt(rearIndex, sourceRear);
-
         sourceFace->PostAttachUpdate();
         sourceRear->PostAttachUpdate();
         sourceFace->UpdateWorldBound();
@@ -217,16 +226,12 @@ namespace
 
         g_appliedThisLoad.store(true, std::memory_order_release);
 
-        REX::INFO(
-            "RUN15 PLAYER rendered-head graft APPLIED. faceNode={} faceIndex={} oldFace={} newFace={} rearIndex={} oldRear={} newRear={}",
+        REX::INFO("RUN15 PLAYER rendered-head graft APPLIED. faceNode={} faceIndex={} oldFace={} newFace={} rearIndex={} oldRear={} newRear={}",
             static_cast<const void*>(faceNode), faceIndex,
-            static_cast<const void*>(targetFace), static_cast<const void*>(sourceFace),
-            rearIndex,
+            static_cast<const void*>(targetFace), static_cast<const void*>(sourceFace), rearIndex,
             static_cast<const void*>(targetRear), static_cast<const void*>(sourceRear));
-        REX::INFO(
-            "RUN15 types: newFaceType={} newRearType={}",
-            RTTIName(sourceFace), RTTIName(sourceRear));
-        REX::INFO("RUN15 did not modify HeadPart records, FaceGen texture paths, materials on disk, or any NPC actor.");
+        REX::INFO("RUN15 new types: face={} rear={}", RTTIName(sourceFace), RTTIName(sourceRear));
+        REX::INFO("RUN15 touched PLAYER rendered nodes only; no HeadPart records, texture paths, disk materials, body, or NPC actors changed.");
         return true;
     }
 
@@ -243,7 +248,7 @@ namespace
             if (a_attempts > 1) {
                 QueueApply(a_attempts - 1);
             } else {
-                REX::ERROR("RUN15 timed out waiting for the player's final female FaceGen node");
+                REX::ERROR("RUN15 timed out waiting for final PLAYER female FaceGen node");
             }
         });
     }
@@ -280,15 +285,12 @@ namespace
 F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
-
     const auto messaging = F4SE::GetMessagingInterface();
     const auto tasks = F4SE::GetTaskInterface();
     if (!messaging || !tasks) {
         return false;
     }
-
     messaging->RegisterListener(MessageHandler);
-    REX::INFO(
-        "ABDOSAPlayerHead RUN15 loaded; POST-BUILD PLAYER rendered-head graft. No BSModelDB detour, no HeadPart duplication, no texture-path edits.");
+    REX::INFO("ABDOSAPlayerHead RUN15 loaded; POST-BUILD PLAYER rendered-head graft. No model detour, HeadPart duplication, or texture-path edits.");
     return true;
 }
