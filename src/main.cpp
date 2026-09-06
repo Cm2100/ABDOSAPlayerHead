@@ -1,3 +1,5 @@
+#include <MinHook.h>
+
 #include <atomic>
 #include <cstring>
 
@@ -44,9 +46,9 @@ namespace
         return _stricmp(a_value + valueLen - suffixLen, a_suffix) == 0;
     }
 
-    [[nodiscard]] const char* RedirectPath(const char* a_name)
+    [[nodiscard]] const char* RedirectPath(const char* a_name, const Args& a_args)
     {
-        if (!a_name || !g_redirectWindow.load(std::memory_order_acquire)) {
+        if (!a_name || !g_redirectWindow.load(std::memory_order_acquire) || !a_args.faceGenModel) {
             return a_name;
         }
 
@@ -67,31 +69,54 @@ namespace
 
     RE::BSResource::ErrorCode Demand1Hook(const char* a_name, RE::BSModelDB::Handle& a_result, const Args& a_args)
     {
-        return g_originalDemand1(RedirectPath(a_name), a_result, a_args);
+        return g_originalDemand1(RedirectPath(a_name, a_args), a_result, a_args);
     }
 
     RE::BSResource::ErrorCode Demand2Hook(const char* a_name, RE::NiPointer<RE::NiNode>* a_result, const Args& a_args)
     {
-        return g_originalDemand2(RedirectPath(a_name), a_result, a_args);
+        return g_originalDemand2(RedirectPath(a_name, a_args), a_result, a_args);
     }
 
-    void InstallModelHooks()
+    [[nodiscard]] bool InstallModelHooks()
     {
-        F4SE::AllocTrampoline(128);
-        auto& trampoline = F4SE::GetTrampoline();
+        const auto init = MH_Initialize();
+        if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
+            REX::ERROR("RUN13 MH_Initialize failed: {}", static_cast<int>(init));
+            return false;
+        }
 
         REL::Relocation<std::uintptr_t> demand1{ RE::ID::BSModelDB::Demand1 };
         REL::Relocation<std::uintptr_t> demand2{ RE::ID::BSModelDB::Demand2 };
 
-        g_originalDemand1 = reinterpret_cast<Demand1Fn>(
-            trampoline.write_branch<5>(demand1.address(), Demand1Hook));
-        g_originalDemand2 = reinterpret_cast<Demand2Fn>(
-            trampoline.write_branch<5>(demand2.address(), Demand2Hook));
+        const auto create1 = MH_CreateHook(
+            reinterpret_cast<LPVOID>(demand1.address()),
+            reinterpret_cast<LPVOID>(&Demand1Hook),
+            reinterpret_cast<LPVOID*>(&g_originalDemand1));
+        if (create1 != MH_OK && create1 != MH_ERROR_ALREADY_CREATED) {
+            REX::ERROR("RUN13 MH_CreateHook Demand1 failed: {}", static_cast<int>(create1));
+            return false;
+        }
+
+        const auto create2 = MH_CreateHook(
+            reinterpret_cast<LPVOID>(demand2.address()),
+            reinterpret_cast<LPVOID>(&Demand2Hook),
+            reinterpret_cast<LPVOID*>(&g_originalDemand2));
+        if (create2 != MH_OK && create2 != MH_ERROR_ALREADY_CREATED) {
+            REX::ERROR("RUN13 MH_CreateHook Demand2 failed: {}", static_cast<int>(create2));
+            return false;
+        }
+
+        const auto enable = MH_EnableHook(MH_ALL_HOOKS);
+        if (enable != MH_OK && enable != MH_ERROR_ENABLED) {
+            REX::ERROR("RUN13 MH_EnableHook failed: {}", static_cast<int>(enable));
+            return false;
+        }
 
         REX::INFO(
-            "RUN13 BSModelDB hooks installed. Demand1={} Demand2={}",
+            "RUN13 BSModelDB MinHook detours installed. Demand1={} Demand2={}",
             reinterpret_cast<const void*>(demand1.address()),
             reinterpret_cast<const void*>(demand2.address()));
+        return true;
     }
 
     [[nodiscard]] RE::BGSHeadPart* FindPartByType(
@@ -241,7 +266,9 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
 {
     F4SE::Init(a_f4se);
 
-    InstallModelHooks();
+    if (!InstallModelHooks()) {
+        return false;
+    }
 
     if (const auto messaging = F4SE::GetMessagingInterface()) {
         messaging->RegisterListener(MessageHandler);
