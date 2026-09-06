@@ -15,6 +15,27 @@ namespace
         return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
     }
 
+    void DumpHeadParts(const char* a_label, std::span<RE::BGSHeadPart*> a_parts)
+    {
+        REX::INFO("{} count={}", a_label, a_parts.size());
+        std::size_t index = 0;
+        for (auto* part : a_parts) {
+            if (!part) {
+                REX::INFO("{}[{}] <null>", a_label, index++);
+                continue;
+            }
+
+            const auto model = part->GetModel() ? part->GetModel() : "<null-model>";
+            REX::INFO(
+                "{}[{}] form={:08X} type={} model={}",
+                a_label,
+                index++,
+                part->GetFormID(),
+                static_cast<std::int32_t>(part->type.get()),
+                model);
+        }
+    }
+
     [[nodiscard]] RE::BGSHeadPart* FindPartByType(
         std::span<RE::BGSHeadPart*> a_parts,
         RE::BGSHeadPart::HeadPartType a_type)
@@ -36,14 +57,15 @@ namespace
             return false;
         }
 
-        // Prefer the ACTIVE list. This is important because LooksMenu/race/chargen can
-        // give the player a different HeadRear record than Fallout4.esm|04D0E9.
         auto active = a_playerNPC->GetHeadParts(true);
+        auto base = a_playerNPC->GetHeadParts(false);
+
+        DumpHeadParts("PLAYER active BEFORE", active);
+        DumpHeadParts("PLAYER base BEFORE", base);
+
         a_face = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kFace);
         a_rear = FindPartByType(active, RE::BGSHeadPart::HeadPartType::kHeadRear);
 
-        // Fall back to the base NPC list only for whichever type was not present.
-        auto base = a_playerNPC->GetHeadParts(false);
         if (!a_face) {
             a_face = FindPartByType(base, RE::BGSHeadPart::HeadPartType::kFace);
         }
@@ -60,9 +82,11 @@ namespace
         }
 
         REX::INFO(
-            "Resolved PLAYER source parts by TYPE. face={:08X}, rear={:08X}",
+            "Resolved PLAYER source parts by TYPE. face={:08X} model={} rear={:08X} model={}",
             a_face->GetFormID(),
-            a_rear->GetFormID());
+            a_face->GetModel() ? a_face->GetModel() : "<null-model>",
+            a_rear->GetFormID(),
+            a_rear->GetModel() ? a_rear->GetModel() : "<null-model>");
         return true;
     }
 
@@ -80,6 +104,11 @@ namespace
         }
 
         duplicate->SetModel(a_model);
+        REX::INFO(
+            "Created private head part form={:08X} type={} model={}",
+            duplicate->GetFormID(),
+            static_cast<std::int32_t>(duplicate->type.get()),
+            duplicate->GetModel() ? duplicate->GetModel() : "<null-model>");
         return duplicate;
     }
 
@@ -127,8 +156,6 @@ namespace
                 continue;
             }
 
-            // Do NOT depend on Fallout4.esm FormIDs here. Replace whichever Face and
-            // HeadRear records the PLAYER actually owns, including LooksMenu/custom ones.
             if (part->type == RE::BGSHeadPart::HeadPartType::kFace) {
                 part = g_playerFacePart;
                 result.face = true;
@@ -160,6 +187,9 @@ namespace
             active.face,
             active.rear);
 
+        DumpHeadParts("PLAYER active AFTER", a_playerNPC->GetHeadParts(true));
+        DumpHeadParts("PLAYER base AFTER", a_playerNPC->GetHeadParts(false));
+
         return faceOK && rearOK;
     }
 
@@ -181,9 +211,40 @@ namespace
         const auto id = GetDoUpdate3DModelID();
         REL::Relocation<update3d_t> doUpdate3D{ REL::ID(id) };
 
-        REX::INFO("Rebuilding PLAYER head with private head-part forms; relocation ID {}", id);
+        const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
+        REX::INFO(
+            "Rebuilding PLAYER head with private head-part forms; runtime={}.{}.{}.{} relocation ID {}",
+            runtime.major(), runtime.minor(), runtime.patch(), runtime.build(), id);
         doUpdate3D(a_player->currentProcess, static_cast<RE::Actor*>(a_player), kHeadFaceFlags);
         return true;
+    }
+
+    void QueueSecondRebuild(std::uint32_t a_ticks)
+    {
+        const auto* tasks = F4SE::GetTaskInterface();
+        if (!tasks) {
+            RebuildPlayerHead(RE::PlayerCharacter::GetSingleton());
+            return;
+        }
+
+        tasks->AddTask([a_ticks]() {
+            if (a_ticks > 1) {
+                QueueSecondRebuild(a_ticks - 1);
+                return;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                REX::ERROR("PLAYER vanished before delayed second rebuild");
+                return;
+            }
+
+            if (auto* npc = player->GetNPC()) {
+                DumpHeadParts("PLAYER active BEFORE SECOND REBUILD", npc->GetHeadParts(true));
+            }
+            REX::INFO("Executing delayed SECOND PLAYER head rebuild");
+            RebuildPlayerHead(player);
+        });
     }
 
     bool ApplyToPlayer()
@@ -200,6 +261,12 @@ namespace
             return false;
         }
 
+        REX::INFO(
+            "Applying player-only head split. Player actor={:08X}, Player NPC={:08X}, alternateList={}",
+            player->GetFormID(),
+            playerNPC->GetFormID(),
+            playerNPC->UsingAlternateHeadPartList());
+
         RE::BGSHeadPart* sourceFace = nullptr;
         RE::BGSHeadPart* sourceRear = nullptr;
         if (!ResolvePlayerSourceParts(playerNPC, sourceFace, sourceRear)) {
@@ -215,11 +282,15 @@ namespace
             return false;
         }
 
-        // No shared Fallout4.esm HDPT model path is changed at any point.
-        // NPCs keep whatever normal Face/HeadRear records they already use.
-        // Only the PLAYER's head-part pointers are replaced with private duplicates.
         REX::INFO("PLAYER owns private Face/HeadRear parts; all NPC head-part records untouched");
-        return RebuildPlayerHead(player);
+        if (!RebuildPlayerHead(player)) {
+            return false;
+        }
+
+        // The private pointers remain installed, so a second rebuild is safe and cannot
+        // leak to NPCs. It also covers any asynchronous/cache delay in the first rebuild.
+        QueueSecondRebuild(2);
+        return true;
     }
 
     void QueueApply(std::uint32_t a_attempts)
@@ -246,6 +317,7 @@ namespace
         switch (a_message->type) {
         case F4SE::MessagingInterface::kPostLoadGame:
         case F4SE::MessagingInterface::kNewGame:
+            REX::INFO("Received load/new-game message type {}; queuing PLAYER head apply", a_message->type);
             QueueApply(30);
             break;
         default:
@@ -270,6 +342,6 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead loaded; player-only head split by HeadPart TYPE armed");
+    REX::INFO("ABDOSAPlayerHead RUN10 loaded; diagnostics + delayed second rebuild armed");
     return true;
 }
