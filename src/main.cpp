@@ -1,4 +1,7 @@
 #include <MinHook.h>
+#ifdef ERROR
+#    undef ERROR
+#endif
 
 #include <atomic>
 #include <cstring>
