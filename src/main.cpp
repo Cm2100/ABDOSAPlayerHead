@@ -14,7 +14,7 @@ namespace
 
     [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
     {
-        const auto runtime = REL::Module::get().version();
+        const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
         return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
     }
 
