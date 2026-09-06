@@ -11,11 +11,59 @@ namespace
 
     std::string g_faceOriginal;
     std::string g_rearOriginal;
+    bool g_redirectActive = false;
 
     [[nodiscard]] std::uint64_t GetDoUpdate3DModelID()
     {
         const auto runtime = REX::FModule::GetExecutingModule().GetFileVersion();
         return runtime >= REL::Version{ 1, 10, 980, 0 } ? kDoUpdate3DModelNG : kDoUpdate3DModelOG;
+    }
+
+    [[nodiscard]] bool ResolveHeadParts(RE::BGSHeadPart*& a_face, RE::BGSHeadPart*& a_rear)
+    {
+        auto* faceForm = RE::TESForm::GetFormByID(kFemaleFaceHeadPart);
+        auto* rearForm = RE::TESForm::GetFormByID(kFemaleRearHeadPart);
+        a_face = faceForm ? faceForm->As<RE::BGSHeadPart>() : nullptr;
+        a_rear = rearForm ? rearForm->As<RE::BGSHeadPart>() : nullptr;
+        return a_face && a_rear;
+    }
+
+    void RestoreVanillaHeadPaths()
+    {
+        RE::BGSHeadPart* face = nullptr;
+        RE::BGSHeadPart* rear = nullptr;
+        if (!ResolveHeadParts(face, rear)) {
+            REX::ERROR("Could not resolve vanilla female head parts while restoring paths");
+            return;
+        }
+
+        if (!g_faceOriginal.empty()) {
+            face->SetModel(g_faceOriginal.c_str());
+        }
+        if (!g_rearOriginal.empty()) {
+            rear->SetModel(g_rearOriginal.c_str());
+        }
+
+        g_redirectActive = false;
+        REX::INFO("Restored vanilla global female head model paths after player rebuild window");
+    }
+
+    void QueueRestore(std::uint32_t a_frames)
+    {
+        const auto* tasks = F4SE::GetTaskInterface();
+        if (!tasks) {
+            REX::WARN("F4SE task interface unavailable; restoring paths immediately");
+            RestoreVanillaHeadPaths();
+            return;
+        }
+
+        tasks->AddTask([a_frames]() {
+            if (a_frames > 1) {
+                QueueRestore(a_frames - 1);
+            } else {
+                RestoreVanillaHeadPaths();
+            }
+        });
     }
 
     bool RebuildPlayerHead(RE::PlayerCharacter* a_player)
@@ -36,7 +84,7 @@ namespace
         const auto id = GetDoUpdate3DModelID();
         REL::Relocation<update3d_t> doUpdate3D{ REL::ID(id) };
 
-        REX::INFO("Calling synchronous DoUpdate3dModel relocation ID {}", id);
+        REX::INFO("Calling DoUpdate3dModel relocation ID {}", id);
         doUpdate3D(a_player->currentProcess, static_cast<RE::Actor*>(a_player), kHeadFaceFlags);
         return true;
     }
@@ -44,16 +92,14 @@ namespace
     bool ApplyToPlayer()
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            REX::WARN("Player singleton not ready");
+        if (!player || !player->currentProcess) {
+            REX::WARN("Player or AIProcess not ready");
             return false;
         }
 
-        auto* faceForm = RE::TESForm::GetFormByID(kFemaleFaceHeadPart);
-        auto* rearForm = RE::TESForm::GetFormByID(kFemaleRearHeadPart);
-        auto* face = faceForm ? faceForm->As<RE::BGSHeadPart>() : nullptr;
-        auto* rear = rearForm ? rearForm->As<RE::BGSHeadPart>() : nullptr;
-        if (!face || !rear) {
+        RE::BGSHeadPart* face = nullptr;
+        RE::BGSHeadPart* rear = nullptr;
+        if (!ResolveHeadParts(face, rear)) {
             REX::ERROR("Could not resolve vanilla female head parts");
             return false;
         }
@@ -65,23 +111,40 @@ namespace
             g_rearOriginal = rear->GetModel() ? rear->GetModel() : "";
         }
 
-        // Redirect only while the PLAYER'S head rebuild is executed synchronously.
-        // The global vanilla HDPT model paths are restored immediately afterwards,
-        // so NPCs keep using the vanilla front/rear head meshes.
+        REX::INFO("Original face model: {}", g_faceOriginal);
+        REX::INFO("Original rear model: {}", g_rearOriginal);
+
         face->SetModel(kCustomFace);
         rear->SetModel(kCustomRear);
+        g_redirectActive = true;
 
+        REX::INFO("Temporary player rebuild redirect enabled");
         const bool rebuilt = RebuildPlayerHead(player);
-
-        face->SetModel(g_faceOriginal.c_str());
-        rear->SetModel(g_rearOriginal.c_str());
-
         if (!rebuilt) {
+            RestoreVanillaHeadPaths();
             return false;
         }
 
-        REX::INFO("Applied custom front/rear head meshes to player and restored vanilla global paths");
+        // DoUpdate3dModel can start model/resource work that outlives this call.
+        // Keep the redirected paths alive for two task ticks so the PLAYER rebuild
+        // can actually consume the custom NIF paths, then restore vanilla paths.
+        QueueRestore(2);
         return true;
+    }
+
+    void QueueApply(std::uint32_t a_attempts)
+    {
+        const auto* tasks = F4SE::GetTaskInterface();
+        if (!tasks) {
+            ApplyToPlayer();
+            return;
+        }
+
+        tasks->AddTask([a_attempts]() {
+            if (!ApplyToPlayer() && a_attempts > 1) {
+                QueueApply(a_attempts - 1);
+            }
+        });
     }
 
     void MessageHandler(F4SE::MessagingInterface::Message* a_message)
@@ -91,13 +154,12 @@ namespace
         }
 
         switch (a_message->type) {
-        case F4SE::MessagingInterface::kGameDataReady:
-            if (static_cast<bool>(a_message->data)) {
-                ApplyToPlayer();
-            }
-            break;
         case F4SE::MessagingInterface::kPostLoadGame:
-            ApplyToPlayer();
+            // Run on the task queue instead of inside the load-game message itself.
+            QueueApply(30);
+            break;
+        case F4SE::MessagingInterface::kNewGame:
+            QueueApply(30);
             break;
         default:
             break;
@@ -116,6 +178,11 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
         return false;
     }
 
-    REX::INFO("ABDOSAPlayerHead loaded");
+    if (!F4SE::GetTaskInterface()) {
+        REX::ERROR("F4SE task interface unavailable");
+        return false;
+    }
+
+    REX::INFO("ABDOSAPlayerHead loaded; delayed player-only head redirect armed");
     return true;
 }
