@@ -57,13 +57,13 @@ namespace
 
         if (EndsWithI(a_name, kVanillaFaceSuffix)) {
             const auto hit = ++g_faceRedirects;
-            REX::INFO("RUN13 redirect FACE request #{}: {} -> {}", hit, a_name, kCustomFace);
+            REX::INFO("RUN14 redirect FACE request #{}: {} -> {}", hit, a_name, kCustomFace);
             return kCustomFace;
         }
 
         if (EndsWithI(a_name, kVanillaRearSuffix)) {
             const auto hit = ++g_rearRedirects;
-            REX::INFO("RUN13 redirect REAR request #{}: {} -> {}", hit, a_name, kCustomRear);
+            REX::INFO("RUN14 redirect REAR request #{}: {} -> {}", hit, a_name, kCustomRear);
             return kCustomRear;
         }
 
@@ -84,7 +84,7 @@ namespace
     {
         const auto init = MH_Initialize();
         if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
-            REX::ERROR("RUN13 MH_Initialize failed: {}", static_cast<int>(init));
+            REX::ERROR("RUN14 MH_Initialize failed: {}", static_cast<int>(init));
             return false;
         }
 
@@ -96,7 +96,7 @@ namespace
             reinterpret_cast<LPVOID>(&Demand1Hook),
             reinterpret_cast<LPVOID*>(&g_originalDemand1));
         if (create1 != MH_OK && create1 != MH_ERROR_ALREADY_CREATED) {
-            REX::ERROR("RUN13 MH_CreateHook Demand1 failed: {}", static_cast<int>(create1));
+            REX::ERROR("RUN14 MH_CreateHook Demand1 failed: {}", static_cast<int>(create1));
             return false;
         }
 
@@ -105,18 +105,18 @@ namespace
             reinterpret_cast<LPVOID>(&Demand2Hook),
             reinterpret_cast<LPVOID*>(&g_originalDemand2));
         if (create2 != MH_OK && create2 != MH_ERROR_ALREADY_CREATED) {
-            REX::ERROR("RUN13 MH_CreateHook Demand2 failed: {}", static_cast<int>(create2));
+            REX::ERROR("RUN14 MH_CreateHook Demand2 failed: {}", static_cast<int>(create2));
             return false;
         }
 
         const auto enable = MH_EnableHook(MH_ALL_HOOKS);
         if (enable != MH_OK && enable != MH_ERROR_ENABLED) {
-            REX::ERROR("RUN13 MH_EnableHook failed: {}", static_cast<int>(enable));
+            REX::ERROR("RUN14 MH_EnableHook failed: {}", static_cast<int>(enable));
             return false;
         }
 
         REX::INFO(
-            "RUN13 BSModelDB MinHook detours installed. Demand1={} Demand2={}",
+            "RUN14 BSModelDB MinHook detours installed. Demand1={} Demand2={}",
             reinterpret_cast<const void*>(demand1.address()),
             reinterpret_cast<const void*>(demand2.address()));
         return true;
@@ -134,9 +134,12 @@ namespace
         return nullptr;
     }
 
-    [[nodiscard]] bool PlayerFemaleHeadReady(RE::PlayerCharacter* a_player)
+    // RUN14 deliberately does NOT require an already-built 3D/FaceNode here.
+    // RUN13 did, which created a circular dependency: if the shared chargen mesh
+    // was absent or not yet loaded, the redirect window could never arm.
+    [[nodiscard]] bool PlayerFemaleHeadMetadataReady(RE::PlayerCharacter* a_player)
     {
-        if (!a_player || !a_player->Get3D() || !a_player->GetFaceNodeSkinned()) {
+        if (!a_player) {
             return false;
         }
 
@@ -159,7 +162,7 @@ namespace
 
         if (!femaleFace || !femaleRear) {
             REX::INFO(
-                "RUN13 waiting for female player head. faceCG={} rearCG={}",
+                "RUN14 waiting for female player head metadata. faceCG={} rearCG={}",
                 faceCG ? faceCG : "<null>",
                 rearCG ? rearCG : "<null>");
         }
@@ -169,7 +172,7 @@ namespace
     bool RebuildPlayerHeadWithRedirect()
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!PlayerFemaleHeadReady(player) || !player->currentProcess) {
+        if (!PlayerFemaleHeadMetadataReady(player) || !player->currentProcess) {
             return false;
         }
 
@@ -192,11 +195,16 @@ namespace
         const auto id = GetDoUpdate3DModelID();
         REL::Relocation<Update3DFn> doUpdate3D{ REL::ID(id) };
 
-        REX::INFO("RUN13 starting PLAYER-only head rebuild; redirect window ARMED. relocation={}", id);
+        REX::INFO(
+            "RUN14 starting PLAYER-only head rebuild BEFORE face-node readiness; redirect window ARMED. relocation={} existing3D={} existingFaceNode={}",
+            id,
+            static_cast<const void*>(player->Get3D()),
+            static_cast<const void*>(player->GetFaceNodeSkinned()));
+
         doUpdate3D(player->currentProcess, static_cast<RE::Actor*>(player), kHeadFaceFlags);
 
         REX::INFO(
-            "RUN13 DoUpdate3DModel returned. faceRedirects={} rearRedirects={}",
+            "RUN14 DoUpdate3DModel returned. faceRedirects={} rearRedirects={}",
             g_faceRedirects.load(),
             g_rearRedirects.load());
 
@@ -221,7 +229,7 @@ namespace
             auto* player = RE::PlayerCharacter::GetSingleton();
             auto* faceNode = player ? player->GetFaceNodeSkinned() : nullptr;
             REX::INFO(
-                "RUN13 redirect window CLOSED. faceRedirects={} rearRedirects={} faceNode={}",
+                "RUN14 redirect window CLOSED. faceRedirects={} rearRedirects={} faceNode={}",
                 g_faceRedirects.load(),
                 g_rearRedirects.load(),
                 static_cast<const void*>(faceNode));
@@ -284,6 +292,6 @@ F4SE_PLUGIN_LOAD(const F4SE::LoadInterface* a_f4se)
     }
 
     REX::INFO(
-        "ABDOSAPlayerHead RUN13 loaded; PLAYER-SCOPED FaceGen model-request redirect. No HeadPart records or texture paths are modified.");
+        "ABDOSAPlayerHead RUN14 loaded; early PLAYER head FaceGen redirect. No HeadPart records or texture paths are modified.");
     return true;
 }
